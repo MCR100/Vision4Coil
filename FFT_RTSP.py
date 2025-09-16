@@ -26,7 +26,7 @@ DEVICE = 0 if torch.cuda.is_available() else 'cpu'
 #CAMERA_IP = "cam_ip" #192.168.1.100
 RTSP_URL = f"rtsp://172.21.164.154:8554/mystream"
 
-model = YOLO("best_latest.pt")
+model = YOLO("best.pt")
 
 def compute_fft_spectrum(frame, roi_points):
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
@@ -185,6 +185,7 @@ def process_rtsp_stream(rtsp_url, roi_points):
     frame_idx = 0
     in_segment = False
     segment_start = None
+    
     segment_frames = []
     segment_time = []
     segment_intensities = []
@@ -211,7 +212,6 @@ def process_rtsp_stream(rtsp_url, roi_points):
                 break
             time.sleep(0.002)
             continue
-
         arrival_ts, frame = frame_buf[-1]
 
         if arrival_ts == last_seen_ts:
@@ -239,6 +239,7 @@ def process_rtsp_stream(rtsp_url, roi_points):
             segment_start = round(current_time, 2)
             segment_frames = []
             segment_time = []
+            segment_wall_start = datetime.now()
             segment_intensities = []
             print(f"Segment START at {segment_start:.2f}s")
 
@@ -256,8 +257,9 @@ def process_rtsp_stream(rtsp_url, roi_points):
                     graph_time = [t for t in graph_time if t >= cutoff]
                     graph_intensity = graph_intensity[-len(graph_time):]
 
-                start_dt = datetime.now() - timedelta(seconds=segment_duration)
+                
                 end_dt = datetime.now()
+                start_dt = segment_wall_start
                 folder = create_timestamped_folder(start_dt, end_dt)
                 base = os.path.join(folder, os.path.basename(folder))
                 save_results_txt(segment_time, segment_intensities, base)
@@ -283,7 +285,8 @@ def process_rtsp_stream(rtsp_url, roi_points):
             fig.canvas.draw_idle()
             fig.canvas.flush_events()
 
-        frame_idx += 1
+
+        
 
 
     stop_read = True
