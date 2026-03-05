@@ -4,3 +4,4 @@ plotly~=6.1.2
 matplotlib~=3.10.3
 ultralytics~=8.3.158
 pandas~=2.3.0
+flask
