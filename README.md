@@ -4,6 +4,11 @@
 
 A vision-based system to detect and analyze frequency characteristics in steel coil manufacturing using real-time or video feed. The system uses FFT analysis and YOLO detection to monitor coil tail presence and save relevant visual and statistical data during significant coil motion.
 
+The system can run either:
+
+- **Standalone (local GUI)** using OpenCV windows and Matplotlib graphs
+- **Web interface mode** using a browser-based dashboard
+
 ---
 
 ## 📦 Installation
@@ -22,13 +27,14 @@ plotly~=6.1.2
 matplotlib~=3.10.3
 ultralytics~=8.3.158
 pandas~=2.3.0
+flask
 ```
 
 ---
 
 ## 📹 Using RTSP Stream
 
-To process a live camera feed via RTSP, edit the script to include:
+To process a live camera feed via RTSP, edit the script (`FFT_RTSP.py`) to include:
 
 ```python
 USERNAME = "your_username"
@@ -46,7 +52,7 @@ process_rtsp_stream(RTSP_URL, roi_points)
 
 ## 📁 Output Folder Structure
 
-When a coil motion segment is detected (lasting at least 10 seconds), a timestamped folder is created. For example:
+When a coil motion segment is detected (lasting at least 10 seconds), a timestamped folder is created under 'output/'. For example:
 
 ```
 2025_Jul_13-14-00-12_to_14-00-22/
@@ -76,26 +82,76 @@ THRESHOLD = 4264.8  # For DB16
 
 ## ▶️ Running the Script
 
-To run on a saved video:
+### Local GUI Mode (OpenCV + Matplotlib)
+
+To run the inspection locally with the classic OpenCV window display:
+
+```bash
+python FFT_RTSP.py
+```
+
+This launches:
+
+- **ROI visualization using `cv2.imshow()`**
+- **Live intensity graph using Matplotlib**
+- Automatic segment detection and saving
+
+To run on a saved video, edit the bottom of `FFT_RTSP.py`:
 
 ```python
 video_path = "long_video.mov"
 process_rtsp_stream(video_path, roi_points)
 ```
 
+---
+
+### Web Interface Mode
+
+A browser-based interface is also available.
+
+Start the web server:
+
+```bash
+python webserver.py
+```
+
+Then open:
+
+```
+http://localhost:8000
+```
+
+The web interface provides:
+
+- Live ROI video stream
+- Full frame preview
+- Real-time FFT intensity graph
+- Start/Stop processing controls
+- RTSP or video file input
+
+The web server runs the same processing pipeline internally but streams results to the browser instead of using OpenCV GUI windows.
+
+---
+
+### Saving Logs
+
 To run and save the log:
 
 ```
-python your_script.py > output_log.txt 2>&1         # if using Linux or Windows CMD
-python your_script.py *>&1 | Tee-Object -FilePath output_log.txt   # if using Windows PowerShell
+python FFT_RTSP.py > output_log.txt 2>&1         # if using Linux or Windows CMD
+python FFT_RTSP.py *>&1 | Tee-Object -FilePath output_log.txt   # if using Windows PowerShell
 ```
 
-To use RTSP, update and uncomment the RTSP block as shown above.
+If using the web server:
+
+```
+python webserver.py > output_log.txt 2>&1
+```
 
 ---
 
 ## ✨ Coming Soon
 
 - Config file for different coil types
-- Web interface for visualization
+- Web interface improvements (ROI selection, live controls)
 - Integration with industrial dashboard
