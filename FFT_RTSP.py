@@ -6,7 +6,6 @@ import plotly.graph_objects as go
 import matplotlib.pyplot as plt
 from ultralytics import YOLO
 from pathlib import Path
-import json
 from collections import deque
 
 # ----- CONFIG -----
