@@ -14,6 +14,9 @@ ENV PATH="${VENV_PATH}/bin:${PATH}"
 
 RUN pip install --upgrade pip setuptools wheel
 
-# RUN pip install --no-cache-dir ipykernel jupyter
+COPY requirements.txt /tmp/requirements.txt
+
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install -r /tmp/requirements.txt
 
 WORKDIR /workspaces

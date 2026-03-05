@@ -2,7 +2,11 @@
   "name": "Local Dev (Python)",
   "build": {
     "dockerfile": "Dockerfile",
-    "context": ".."
+    "context": "..",
+    "args": {},
+    "options": [
+      "--progress=plain"
+    ]
   },
   "workspaceFolder": "/workspaces/${localWorkspaceFolderBasename}",
   "customizations": {
@@ -10,15 +14,13 @@
       "extensions": [
         "ms-python.python",
         "ms-python.vscode-pylance"
-        //"ms-toolsai.jupyter"
       ],
       "settings": {
         "python.defaultInterpreterPath": "/opt/venv/bin/python",
         "python.terminal.activateEnvironment": true,
-        "terminal.integrated.defaultProfile.linux": "bash",
-        "jupyter.notebookFileRoot": "${workspaceFolder}"
+        "terminal.integrated.defaultProfile.linux": "bash"
       }
     }
   },
-  "postCreateCommand": "python -m pip install -r requirements.txt" //&& python -c \"import torch; print('torch', torch.__version__)\""
+  "forwardPorts": [8000]
 }
