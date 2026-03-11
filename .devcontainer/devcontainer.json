@@ -1,0 +1,26 @@
+{
+  "name": "Local Dev (Python)",
+  "build": {
+    "dockerfile": "Dockerfile",
+    "context": "..",
+    "args": {},
+    "options": [
+      "--progress=plain"
+    ]
+  },
+  "workspaceFolder": "/workspaces/${localWorkspaceFolderBasename}",
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "ms-python.python",
+        "ms-python.vscode-pylance"
+      ],
+      "settings": {
+        "python.defaultInterpreterPath": "/opt/venv/bin/python",
+        "python.terminal.activateEnvironment": true,
+        "terminal.integrated.defaultProfile.linux": "bash"
+      }
+    }
+  },
+  "forwardPorts": [8000]
+}
