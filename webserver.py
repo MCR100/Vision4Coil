@@ -118,7 +118,7 @@ def index():
       <div class="row" style="justify-content:space-between;">
         <b>Intensity</b>
         <div class="row">
-          <input id="src" style="min-width:340px" value="temp/RM-LOOP-LAY 1.mov" />
+          <input id="src" style="min-width:340px" value="temp/21_08_2025_P1-00.00.00.000-01.05.57.296.mov" />
           <button onclick="start()">Start</button>
           <button onclick="stop()">Stop</button>
         </div>
