@@ -1,14 +1,14 @@
 import cv2
 import numpy as np
 import os
+import math
+import json
 from datetime import timedelta, datetime
 import plotly.graph_objects as go
 import matplotlib.pyplot as plt
 from ultralytics import YOLO
 from pathlib import Path
 from collections import deque
-import json
-import math
 
 # ----- CONFIG -----
 THRESHOLD = 4264.8  # 4264.8 for DB16 ; 3200 for R5.5 ; 3900 for R8.5
@@ -22,23 +22,24 @@ RTSP_URL = f"rtsp://{USERNAME}:{PASSWORD}@{CAMERA_IP}:554/cam/realmonitor?channe
 OUTPUT_DIR = Path("output")
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-model = YOLO("best.pt")
-
-# Fallback body-offset tuning
-LOCAL_BAND_HALF_HEIGHT = 180
-MIN_BODY_PIXELS_FOR_MEDIAN = 40
+# Segmentation-capable YOLO model
+model = YOLO("YOLO11/weights/best.pt")
 
 # Hardcoded body reference polyline
 BODY_POLYLINE_POINTS = [
     (1386, 753),
     (1167, 1074),
-    (916, 1432)
+    (916, 1432),
 ]
 
-# Loop-fit tuning
-ELLIPSE_SEARCH_PAD_X = 420
-ELLIPSE_SEARCH_PAD_Y_UP = 260
-ELLIPSE_SEARCH_PAD_Y_DOWN = 380
+# Median-x fallback tuning
+LOCAL_BAND_HALF_HEIGHT = 180
+MIN_BODY_PIXELS_FOR_MEDIAN = 40
+
+# Ellipse / loop-fit tuning
+ELLIPSE_SEARCH_PAD_X = 320
+ELLIPSE_SEARCH_PAD_Y_UP = 180
+ELLIPSE_SEARCH_PAD_Y_DOWN = 260
 MIN_CONTOUR_POINTS_FOR_ELLIPSE = 30
 TAIL_BOX_EXCLUDE_PAD = 12
 
@@ -48,13 +49,17 @@ ELLIPSE_MAX_MAJOR = 1200
 ELLIPSE_MIN_MINOR = 25
 ELLIPSE_MAX_MINOR = 900
 
-# The loop center is usually somewhat near the body path and near/below the tail.
 MAX_CENTER_TO_POLYLINE_DIST = 350
 MAX_CENTER_TO_TAIL_DIST = 950
 MIN_CENTER_TO_TAIL_DIST = 40
 MAX_TAIL_TO_ELLIPSE_BOUNDARY_DIST = 160
 CENTER_ALLOWED_ABOVE_TAIL = 280
 CENTER_ALLOWED_BELOW_TAIL = 650
+
+# Rejection rules
+ELLIPSE_CENTER_ROI_MARGIN = 30
+MIN_ELLIPSE_MASK_OVERLAP_RATIO = 0.08
+ELLIPSE_OVERLAP_THICKNESS = 3
 
 
 # --------------
@@ -136,167 +141,10 @@ class CvGuiSink(BaseSink):
 class NullSink(BaseSink):
     pass
 
-def point_to_segment_distance(px, py, x1, y1, x2, y2):
-    dx = x2 - x1
-    dy = y2 - y1
-    if dx == 0 and dy == 0:
-        return float(np.hypot(px - x1, py - y1))
 
-    t = ((px - x1) * dx + (py - y1) * dy) / (dx * dx + dy * dy)
-    t = max(0.0, min(1.0, t))
-    proj_x = x1 + t * dx
-    proj_y = y1 + t * dy
-    return float(np.hypot(px - proj_x, py - proj_y))
-
-
-def point_to_polyline_distance(px, py, points):
-    pts = get_sorted_polyline(points)
-    if len(pts) < 2:
-        return None
-
-    best = None
-    for i in range(len(pts) - 1):
-        x1, y1 = pts[i]
-        x2, y2 = pts[i + 1]
-        d = point_to_segment_distance(px, py, x1, y1, x2, y2)
-        if best is None or d < best:
-            best = d
-    return best
-
-
-def ellipse_boundary_distance(point, ellipse_info):
-    """
-    Approximate how far a point is from the fitted ellipse boundary.
-    Returns absolute radial mismatch in pixels-ish image units.
-    Lower is better.
-    """
-    px, py = point
-    cx, cy = ellipse_info["center"]
-    a, b = ellipse_info["axes"]
-    rot_deg = ellipse_info["rotation_deg"]
-
-    if a <= 1e-6 or b <= 1e-6:
-        return None
-
-    theta = math.radians(rot_deg)
-    dx = px - cx
-    dy = py - cy
-
-    # Undo ellipse rotation
-    xr = dx * math.cos(theta) + dy * math.sin(theta)
-    yr = -dx * math.sin(theta) + dy * math.cos(theta)
-
-    norm = math.sqrt((xr * xr) / (a * a) + (yr * yr) / (b * b))
-    # norm ~= 1 means point lies on ellipse
-    # convert mismatch to a rough pixel scale
-    return float(abs(norm - 1.0) * max(a, b))
-
-
-def crop_guided_loop_roi(mask, tail_cx, tail_cy, polyline_points):
-    """
-    Build a tighter ROI around the tail, biased by the hardcoded body path.
-    """
-    h, w = mask.shape[:2]
-
-    body_x = polyline_x_at_y(polyline_points, tail_cy)
-    if body_x is None:
-        body_x = tail_cx
-
-    x_center = int(round((tail_cx + body_x) / 2.0))
-
-    x1 = max(0, x_center - ELLIPSE_SEARCH_PAD_X)
-    x2 = min(w, x_center + ELLIPSE_SEARCH_PAD_X)
-
-    y1 = max(0, int(round(tail_cy)) - ELLIPSE_SEARCH_PAD_Y_UP)
-    y2 = min(h, int(round(tail_cy)) + ELLIPSE_SEARCH_PAD_Y_DOWN)
-
-    return mask[y1:y2, x1:x2], (x1, y1, x2, y2)
-
-
-def contour_support_score(contour):
-    return float(cv2.arcLength(contour, closed=False))
-
-
-def fit_ellipse_from_contour(contour, roi_offset):
-    if len(contour) < 5:
-        return None
-
-    ellipse = cv2.fitEllipse(contour)
-    (cx, cy), (d1, d2), rotation_deg = ellipse
-
-    rx1, ry1 = roi_offset
-    cx_full = cx + rx1
-    cy_full = cy + ry1
-
-    a = d1 / 2.0
-    b = d2 / 2.0
-    rot = rotation_deg
-
-    if b > a:
-        a, b = b, a
-        rot = (rot + 90.0) % 180.0
-
-    return {
-        "center": (float(cx_full), float(cy_full)),
-        "axes": (float(a), float(b)),  # semi-major, semi-minor
-        "rotation_deg": float(rot),
-    }
-
-
-def score_ellipse_candidate(ellipse_info, contour, tail_point, polyline_points):
-    """
-    Lower score is better.
-    Returns None if candidate should be rejected.
-    """
-    cx, cy = ellipse_info["center"]
-    a, b = ellipse_info["axes"]
-    tail_cx, tail_cy = tail_point
-
-    # Size filters
-    if not (ELLIPSE_MIN_MAJOR <= a <= ELLIPSE_MAX_MAJOR):
-        return None
-    if not (ELLIPSE_MIN_MINOR <= b <= ELLIPSE_MAX_MINOR):
-        return None
-
-    # Center vs tail constraints
-    center_to_tail = float(np.hypot(cx - tail_cx, cy - tail_cy))
-    if center_to_tail < MIN_CENTER_TO_TAIL_DIST or center_to_tail > MAX_CENTER_TO_TAIL_DIST:
-        return None
-
-    center_dy = cy - tail_cy
-    if center_dy < -CENTER_ALLOWED_ABOVE_TAIL or center_dy > CENTER_ALLOWED_BELOW_TAIL:
-        return None
-
-    # Center should be reasonably close to the expected body path
-    center_to_poly = point_to_polyline_distance(cx, cy, polyline_points)
-    if center_to_poly is None or center_to_poly > MAX_CENTER_TO_POLYLINE_DIST:
-        return None
-
-    # Tail should lie near the ellipse boundary
-    tail_to_boundary = ellipse_boundary_distance((tail_cx, tail_cy), ellipse_info)
-    if tail_to_boundary is None or tail_to_boundary > MAX_TAIL_TO_ELLIPSE_BOUNDARY_DIST:
-        return None
-
-    # Prefer stronger contour support
-    support = contour_support_score(contour)
-
-    # Weighted score: lower is better
-    score = (
-        2.5 * tail_to_boundary +
-        1.2 * center_to_poly +
-        0.4 * abs(center_dy) +
-        0.15 * center_to_tail -
-        0.02 * support
-    )
-
-    return {
-        "score": float(score),
-        "center_to_polyline_dist": float(center_to_poly),
-        "center_to_tail_dist": float(center_to_tail),
-        "tail_to_ellipse_boundary_dist": float(tail_to_boundary),
-        "contour_support": float(support),
-    }
-
+# -------------------------
+# FFT / logging helpers
+# -------------------------
 def compute_fft_spectrum(frame, roi_points):
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
     mask = np.zeros_like(gray, dtype=np.uint8)
@@ -336,50 +184,21 @@ def save_results_txt(time_axis, intensity_values, save_path):
 
 def save_results_html(time_axis, intensity_values, save_path):
     fig = go.Figure()
-    fig.add_trace(go.Scatter(x=time_axis, y=intensity_values, mode='lines', name='Intensity'))
-    fig.update_layout(title="Frequency Intensity Over Time",
-                      xaxis_title="Time (s)",
-                      yaxis_title="Intensity",
-                      template="simple_white")
+    fig.add_trace(go.Scatter(x=time_axis, y=intensity_values, mode="lines", name="Intensity"))
+    fig.update_layout(
+        title="Frequency Intensity Over Time",
+        xaxis_title="Time (s)",
+        yaxis_title="Intensity",
+        template="simple_white",
+    )
     html_file = f"{save_path}.html"
     fig.write_html(html_file)
     print(f"Saved: {html_file}")
 
 
-def build_body_mask(frame, exclude_box=None):
-    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    blur = cv2.GaussianBlur(gray, (5, 5), 0)
-
-    edges = cv2.Canny(blur, 50, 150)
-
-    kernel = np.ones((5, 5), np.uint8)
-    mask = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, kernel, iterations=2)
-    mask = cv2.dilate(mask, kernel, iterations=1)
-
-    if exclude_box is not None:
-        x1, y1, x2, y2 = exclude_box
-        pad = TAIL_BOX_EXCLUDE_PAD
-        x1 = max(0, x1 - pad)
-        y1 = max(0, y1 - pad)
-        x2 = min(mask.shape[1], x2 + pad)
-        y2 = min(mask.shape[0], y2 + pad)
-        mask[y1:y2, x1:x2] = 0
-
-    return mask
-
-
-def median_body_x_from_mask(mask, center_y, half_height):
-    y1 = max(0, int(round(center_y)) - half_height)
-    y2 = min(mask.shape[0], int(round(center_y)) + half_height)
-
-    local = mask[y1:y2, :]
-    ys, xs = np.where(local > 0)
-    if len(xs) < MIN_BODY_PIXELS_FOR_MEDIAN:
-        return None
-
-    return float(np.median(xs))
-
-
+# -------------------------
+# Polyline / geometry helpers
+# -------------------------
 def get_sorted_polyline(points):
     return sorted(points, key=lambda p: p[1])
 
@@ -423,6 +242,71 @@ def draw_polyline(frame, points, color=(255, 0, 0), thickness=2):
         cv2.circle(frame, (int(round(x)), int(round(y))), 4, color, -1)
 
 
+def point_to_segment_distance(px, py, x1, y1, x2, y2):
+    dx = x2 - x1
+    dy = y2 - y1
+    if dx == 0 and dy == 0:
+        return float(np.hypot(px - x1, py - y1))
+
+    t = ((px - x1) * dx + (py - y1) * dy) / (dx * dx + dy * dy)
+    t = max(0.0, min(1.0, t))
+    proj_x = x1 + t * dx
+    proj_y = y1 + t * dy
+    return float(np.hypot(px - proj_x, py - proj_y))
+
+
+def point_to_polyline_distance(px, py, points):
+    pts = get_sorted_polyline(points)
+    if len(pts) < 2:
+        return None
+
+    best = None
+    for i in range(len(pts) - 1):
+        x1, y1 = pts[i]
+        x2, y2 = pts[i + 1]
+        d = point_to_segment_distance(px, py, x1, y1, x2, y2)
+        if best is None or d < best:
+            best = d
+    return best
+
+
+# -------------------------
+# Body-mask / fallback helpers
+# -------------------------
+def build_body_mask(frame, exclude_box=None):
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    blur = cv2.GaussianBlur(gray, (5, 5), 0)
+
+    edges = cv2.Canny(blur, 50, 150)
+
+    kernel = np.ones((5, 5), np.uint8)
+    mask = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, kernel, iterations=2)
+    mask = cv2.dilate(mask, kernel, iterations=1)
+
+    if exclude_box is not None:
+        x1, y1, x2, y2 = exclude_box
+        pad = 10
+        x1 = max(0, x1 - pad)
+        y1 = max(0, y1 - pad)
+        x2 = min(mask.shape[1], x2 + pad)
+        y2 = min(mask.shape[0], y2 + pad)
+        mask[y1:y2, x1:x2] = 0
+
+    return mask
+
+
+def median_body_x_from_mask(mask, center_y, half_height):
+    y1 = max(0, int(round(center_y)) - half_height)
+    y2 = min(mask.shape[0], int(round(center_y)) + half_height)
+
+    local = mask[y1:y2, :]
+    ys, xs = np.where(local > 0)
+    if len(xs) < MIN_BODY_PIXELS_FOR_MEDIAN:
+        return None
+
+    return float(np.median(xs))
+
+
 def choose_body_reference(frame, best_box, tail_cy):
     body_x = polyline_x_at_y(BODY_POLYLINE_POINTS, tail_cy)
     if body_x is not None:
@@ -436,7 +320,127 @@ def choose_body_reference(frame, best_box, tail_cy):
     return None, None
 
 
-def build_loop_edge_mask(frame, exclude_box=None):
+# -------------------------
+# Segmentation helpers
+# -------------------------
+def polygon_to_mask(poly_xy, image_shape):
+    h, w = image_shape[:2]
+    mask = np.zeros((h, w), dtype=np.uint8)
+
+    if poly_xy is None or len(poly_xy) < 3:
+        return mask
+
+    poly = np.round(poly_xy).astype(np.int32)
+    cv2.fillPoly(mask, [poly], 255)
+    return mask
+
+
+def dilate_mask(mask, ksize=9, iterations=1):
+    kernel = np.ones((ksize, ksize), np.uint8)
+    return cv2.dilate(mask, kernel, iterations=iterations)
+
+
+def extract_best_tail_segment(frames, conf_thresh=0.6):
+    best = None
+    best_conf = -1.0
+
+    for frame in reversed(frames[-10:]):
+        result = model.predict(
+            frame,
+            conf=conf_thresh,
+            verbose=False,
+            save=False,
+            retina_masks=True,
+        )[0]
+
+        boxes = result.boxes
+        masks = result.masks
+
+        if boxes is None or masks is None:
+            continue
+
+        segs = masks.xy
+        for i, box in enumerate(boxes):
+            if i >= len(segs):
+                continue
+
+            poly_xy = segs[i]
+            if poly_xy is None or len(poly_xy) < 3:
+                continue
+
+            conf = float(box.conf[0])
+            cls_id = int(box.cls[0])
+            x1, y1, x2, y2 = map(int, box.xyxy[0])
+
+            if conf > best_conf:
+                best_conf = conf
+                best = {
+                    "frame": frame.copy(),
+                    "class_id": cls_id,
+                    "confidence": conf,
+                    "bbox": [x1, y1, x2, y2],
+                    "segment_xy": poly_xy.astype(np.float32),
+                }
+
+    return best
+
+
+def draw_segment_outline(frame, poly_xy, color=(0, 255, 255), thickness=2):
+    if poly_xy is None or len(poly_xy) < 2:
+        return
+    pts = np.round(poly_xy).astype(np.int32)
+    cv2.polylines(frame, [pts], isClosed=True, color=color, thickness=thickness)
+
+
+def segment_centroid(poly_xy):
+    pts = np.asarray(poly_xy, dtype=np.float32)
+    if len(pts) == 0:
+        return None
+    return float(np.mean(pts[:, 0])), float(np.mean(pts[:, 1]))
+
+
+def find_tail_tip_from_segment(poly_xy, polyline_points):
+    """
+    Find two endpoints from the segment major axis.
+    For current footage, the endpoint closer to the polyline is used as the tip.
+    """
+    pts = np.asarray(poly_xy, dtype=np.float32)
+    if len(pts) < 2:
+        return None, None
+
+    mean = np.mean(pts, axis=0)
+    centered = pts - mean
+    cov = np.cov(centered.T)
+    eigvals, eigvecs = np.linalg.eigh(cov)
+    axis = eigvecs[:, np.argmax(eigvals)]
+
+    proj = centered @ axis
+    idx_min = int(np.argmin(proj))
+    idx_max = int(np.argmax(proj))
+
+    end_a = (float(pts[idx_min, 0]), float(pts[idx_min, 1]))
+    end_b = (float(pts[idx_max, 0]), float(pts[idx_max, 1]))
+
+    dist_a = point_to_polyline_distance(end_a[0], end_a[1], polyline_points)
+    dist_b = point_to_polyline_distance(end_b[0], end_b[1], polyline_points)
+
+    if dist_a is None or dist_b is None:
+        return end_a, end_b
+
+    if dist_a <= dist_b:
+        tip = end_a
+        base = end_b
+    else:
+        tip = end_b
+        base = end_a
+
+    return tip, base
+
+
+# -------------------------
+# Ellipse-fit helpers
+# -------------------------
+def build_loop_edge_mask_segment_aware(frame, segment_mask=None, remove_segment=True):
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
     blur = cv2.GaussianBlur(gray, (5, 5), 0)
 
@@ -446,52 +450,189 @@ def build_loop_edge_mask(frame, exclude_box=None):
     mask = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, kernel, iterations=2)
     mask = cv2.dilate(mask, kernel, iterations=1)
 
-    if exclude_box is not None:
-        x1, y1, x2, y2 = exclude_box
-        pad = TAIL_BOX_EXCLUDE_PAD
-        x1 = max(0, x1 - pad)
-        y1 = max(0, y1 - pad)
-        x2 = min(mask.shape[1], x2 + pad)
-        y2 = min(mask.shape[0], y2 + pad)
-        mask[y1:y2, x1:x2] = 0
+    if remove_segment and segment_mask is not None:
+        seg_exclude = dilate_mask(segment_mask, ksize=7, iterations=1)
+        mask[seg_exclude > 0] = 0
 
     return mask
 
 
-def score_contour_for_tail(contour, tail_point_local):
-    if len(contour) < MIN_CONTOUR_POINTS_FOR_ELLIPSE:
+def crop_guided_loop_roi_from_segment(mask, tail_tip, polyline_points):
+    tail_x, tail_y = tail_tip
+    h, w = mask.shape[:2]
+
+    body_x = polyline_x_at_y(polyline_points, tail_y)
+    if body_x is None:
+        body_x = tail_x
+
+    x_center = int(round((tail_x + body_x) / 2.0))
+
+    x1 = max(0, x_center - ELLIPSE_SEARCH_PAD_X)
+    x2 = min(w, x_center + ELLIPSE_SEARCH_PAD_X)
+
+    y1 = max(0, int(round(tail_y)) - ELLIPSE_SEARCH_PAD_Y_UP)
+    y2 = min(h, int(round(tail_y)) + ELLIPSE_SEARCH_PAD_Y_DOWN)
+
+    return mask[y1:y2, x1:x2], (x1, y1, x2, y2)
+
+
+def contour_support_score(contour):
+    return float(cv2.arcLength(contour, closed=False))
+
+
+def fit_ellipse_from_contour(contour, roi_offset):
+    if len(contour) < 5:
         return None
 
-    pts = contour.reshape(-1, 2).astype(np.float32)
-    tx, ty = tail_point_local
+    ellipse = cv2.fitEllipse(contour)
+    (cx, cy), (d1, d2), rotation_deg = ellipse
 
-    dists = np.sqrt((pts[:, 0] - tx) ** 2 + (pts[:, 1] - ty) ** 2)
-    min_dist = float(np.min(dists))
-    contour_len = float(cv2.arcLength(contour, closed=False))
+    rx1, ry1 = roi_offset
+    cx_full = cx + rx1
+    cy_full = cy + ry1
 
-    # Prefer contours close to the tail and reasonably long
-    score = contour_len - 2.0 * min_dist
-    return score
+    a = d1 / 2.0
+    b = d2 / 2.0
+    rot = rotation_deg
+
+    if b > a:
+        a, b = b, a
+        rot = (rot + 90.0) % 180.0
+
+    return {
+        "center": (float(cx_full), float(cy_full)),
+        "axes": (float(a), float(b)),
+        "rotation_deg": float(rot),
+    }
 
 
-def fit_final_loop_ellipse(frame, tail_cx, tail_cy, exclude_box=None):
-    """
-    Fit the final loop ellipse using:
-    - tight ROI around tail guided by the hardcoded polyline
-    - multiple contour candidates
-    - geometric scoring and rejection
-    """
-    mask = build_loop_edge_mask(frame, exclude_box=exclude_box)
-    local_mask, roi_box = crop_guided_loop_roi(mask, tail_cx, tail_cy, BODY_POLYLINE_POINTS)
+def ellipse_boundary_distance(point, ellipse_info):
+    px, py = point
+    cx, cy = ellipse_info["center"]
+    a, b = ellipse_info["axes"]
+    rot_deg = ellipse_info["rotation_deg"]
+
+    if a <= 1e-6 or b <= 1e-6:
+        return None
+
+    theta = math.radians(rot_deg)
+    dx = px - cx
+    dy = py - cy
+
+    xr = dx * math.cos(theta) + dy * math.sin(theta)
+    yr = -dx * math.sin(theta) + dy * math.cos(theta)
+
+    norm = math.sqrt((xr * xr) / (a * a) + (yr * yr) / (b * b))
+    return float(abs(norm - 1.0) * max(a, b))
+
+
+def rasterize_ellipse_mask(image_shape, ellipse_info, thickness=ELLIPSE_OVERLAP_THICKNESS):
+    h, w = image_shape[:2]
+    mask = np.zeros((h, w), dtype=np.uint8)
+
+    cx, cy = ellipse_info["center"]
+    a, b = ellipse_info["axes"]
+    rot = ellipse_info["rotation_deg"]
+
+    center_i = (int(round(cx)), int(round(cy)))
+    axes_i = (max(1, int(round(a))), max(1, int(round(b))))
+
+    cv2.ellipse(mask, center_i, axes_i, rot, 0, 360, 255, thickness)
+    return mask
+
+
+def compute_ellipse_overlap_ratio(frame_shape, ellipse_info, coil_mask):
+    ellipse_mask = rasterize_ellipse_mask(frame_shape, ellipse_info)
+
+    ellipse_pixels = np.count_nonzero(ellipse_mask)
+    if ellipse_pixels == 0:
+        return 0.0
+
+    overlap = np.count_nonzero((ellipse_mask > 0) & (coil_mask > 0))
+    return float(overlap / ellipse_pixels)
+
+
+def center_inside_roi_with_margin(center, roi_box, margin=ELLIPSE_CENTER_ROI_MARGIN):
+    cx, cy = center
+    x1, y1, x2, y2 = roi_box
+    return (
+        x1 - margin <= cx <= x2 + margin and
+        y1 - margin <= cy <= y2 + margin
+    )
+
+
+def score_ellipse_candidate(ellipse_info, contour, tail_point, polyline_points, roi_box, coil_mask, frame_shape):
+    cx, cy = ellipse_info["center"]
+    a, b = ellipse_info["axes"]
+    tail_cx, tail_cy = tail_point
+
+    if not (ELLIPSE_MIN_MAJOR <= a <= ELLIPSE_MAX_MAJOR):
+        return None
+    if not (ELLIPSE_MIN_MINOR <= b <= ELLIPSE_MAX_MINOR):
+        return None
+
+    if not center_inside_roi_with_margin((cx, cy), roi_box, margin=ELLIPSE_CENTER_ROI_MARGIN):
+        return None
+
+    center_to_tail = float(np.hypot(cx - tail_cx, cy - tail_cy))
+    if center_to_tail < MIN_CENTER_TO_TAIL_DIST or center_to_tail > MAX_CENTER_TO_TAIL_DIST:
+        return None
+
+    center_dy = cy - tail_cy
+    if center_dy < -CENTER_ALLOWED_ABOVE_TAIL or center_dy > CENTER_ALLOWED_BELOW_TAIL:
+        return None
+
+    center_to_poly = point_to_polyline_distance(cx, cy, polyline_points)
+    if center_to_poly is None or center_to_poly > MAX_CENTER_TO_POLYLINE_DIST:
+        return None
+
+    tail_to_boundary = ellipse_boundary_distance((tail_cx, tail_cy), ellipse_info)
+    if tail_to_boundary is None or tail_to_boundary > MAX_TAIL_TO_ELLIPSE_BOUNDARY_DIST:
+        return None
+
+    overlap_ratio = compute_ellipse_overlap_ratio(frame_shape, ellipse_info, coil_mask)
+    if overlap_ratio < MIN_ELLIPSE_MASK_OVERLAP_RATIO:
+        return None
+
+    support = contour_support_score(contour)
+
+    score = (
+        2.5 * tail_to_boundary +
+        1.8 * center_to_poly +
+        0.4 * abs(center_dy) +
+        0.15 * center_to_tail -
+        0.02 * support -
+        180.0 * overlap_ratio
+    )
+
+    return {
+        "score": float(score),
+        "center_to_polyline_dist": float(center_to_poly),
+        "center_to_tail_dist": float(center_to_tail),
+        "tail_to_ellipse_boundary_dist": float(tail_to_boundary),
+        "contour_support": float(support),
+        "ellipse_overlap_ratio": float(overlap_ratio),
+    }
+
+
+def fit_final_loop_ellipse_from_segment(frame, segment_xy, tail_tip, remove_segment_from_edges=True):
+    segment_mask = polygon_to_mask(segment_xy, frame.shape)
+
+    edge_mask = build_loop_edge_mask_segment_aware(
+        frame,
+        segment_mask=segment_mask,
+        remove_segment=remove_segment_from_edges,
+    )
+
+    local_mask, roi_box = crop_guided_loop_roi_from_segment(edge_mask, tail_tip, BODY_POLYLINE_POINTS)
     rx1, ry1, rx2, ry2 = roi_box
 
     contours, _ = cv2.findContours(local_mask, cv2.RETR_LIST, cv2.CHAIN_APPROX_NONE)
     if not contours:
-        return None, mask, roi_box, None
-
-    tail_point = (float(tail_cx), float(tail_cy))
+        return None, edge_mask, roi_box, None
 
     best_candidate = None
+    tail_point = (float(tail_tip[0]), float(tail_tip[1]))
 
     for cnt in contours:
         if len(cnt) < MIN_CONTOUR_POINTS_FOR_ELLIPSE:
@@ -505,7 +646,10 @@ def fit_final_loop_ellipse(frame, tail_cx, tail_cy, exclude_box=None):
             ellipse_info=ellipse_info,
             contour=cnt,
             tail_point=tail_point,
-            polyline_points=BODY_POLYLINE_POINTS
+            polyline_points=BODY_POLYLINE_POINTS,
+            roi_box=roi_box,
+            coil_mask=edge_mask,
+            frame_shape=frame.shape,
         )
         if metrics is None:
             continue
@@ -519,19 +663,14 @@ def fit_final_loop_ellipse(frame, tail_cx, tail_cy, exclude_box=None):
             best_candidate = candidate
 
     if best_candidate is None:
-        return None, mask, roi_box, None
+        return None, edge_mask, roi_box, None
 
     ellipse_info = best_candidate["ellipse_info"]
     ellipse_info["roi_box"] = roi_box
+    return ellipse_info, edge_mask, roi_box, best_candidate["metrics"]
 
-    return ellipse_info, mask, roi_box, best_candidate["metrics"]
 
 def point_to_ellipse_angle_deg(point, ellipse_info):
-    """
-    Image-plane ellipse angle.
-    0° is along ellipse local +x axis before rotation.
-    Returned angle is 0..360.
-    """
     px, py = point
     cx, cy = ellipse_info["center"]
     a, b = ellipse_info["axes"]
@@ -541,14 +680,12 @@ def point_to_ellipse_angle_deg(point, ellipse_info):
     dx = px - cx
     dy = py - cy
 
-    # Undo ellipse rotation
     xr = dx * math.cos(theta) + dy * math.sin(theta)
     yr = -dx * math.sin(theta) + dy * math.cos(theta)
 
     if a <= 1e-6 or b <= 1e-6:
         return None
 
-    # Ellipse parameter angle
     t = math.atan2(yr / b, xr / a)
     deg = math.degrees(t)
     if deg < 0:
@@ -573,160 +710,156 @@ def draw_loop_search_roi(frame, roi_box, color=(120, 120, 120), thickness=1):
     cv2.rectangle(frame, (x1, y1), (x2, y2), color, thickness)
 
 
+# -------------------------
+# Detection + save
+# -------------------------
 def detect_tail_and_save(frames, roi_points, save_path, conf_thresh=0.6):
-    best_conf = 0
-    best_frame = None
-    best_box = None
-    best_cls = None
+    best = extract_best_tail_segment(frames, conf_thresh=conf_thresh)
+    if best is None:
+        return
 
-    for frame in reversed(frames[-10:]):
-        result = model.predict(frame, conf=conf_thresh, verbose=False, save=False)[0]
-        boxes = result.boxes
-        if boxes is None:
-            continue
+    best_frame = best["frame"]
+    best_cls = best["class_id"]
+    best_conf = best["confidence"]
+    best_box = best["bbox"]
+    segment_xy = best["segment_xy"]
 
-        for box in boxes:
-            cls_id = int(box.cls[0])
-            conf = float(box.conf[0])
-            if conf > best_conf:
-                x1, y1, x2, y2 = map(int, box.xyxy[0])
-                best_conf = conf
-                best_cls = cls_id
-                best_box = [int(x1), int(y1), int(x2), int(y2)]
-                best_frame = frame.copy()
+    Path(save_path).mkdir(parents=True, exist_ok=True)
 
-    if best_conf > 0 and best_frame is not None and best_box is not None:
-        Path(save_path).mkdir(parents=True, exist_ok=True)
+    tail_tip, tail_base = find_tail_tip_from_segment(segment_xy, BODY_POLYLINE_POINTS)
+    seg_cent = segment_centroid(segment_xy)
 
+    if tail_tip is None:
         x1, y1, x2, y2 = best_box
-        tail_cx = (x1 + x2) / 2.0
-        tail_cy = (y1 + y2) / 2.0
-        tail_pt = (int(round(tail_cx)), int(round(tail_cy)))
+        tail_tip = ((x1 + x2) / 2.0, (y1 + y2) / 2.0)
 
-        # Existing linear reference
-        body_x, body_method = choose_body_reference(best_frame, best_box, tail_cy)
-        signed_offset_x_px = None
-        abs_offset_x_px = None
+    tail_cx, tail_cy = tail_tip
+    tail_pt = (int(round(tail_cx)), int(round(tail_cy)))
 
-        # Improved loop/ellipse reference
-        ellipse_info, loop_mask, loop_roi_box, ellipse_metrics = fit_final_loop_ellipse(
-            best_frame, tail_cx, tail_cy, exclude_box=None
-        )
+    body_x, body_method = choose_body_reference(best_frame, best_box, tail_cy)
+    signed_offset_x_px = None
+    abs_offset_x_px = None
 
-        tail_loop_angle_deg = None
+    ellipse_info, loop_mask, loop_roi_box, ellipse_metrics = fit_final_loop_ellipse_from_segment(
+        best_frame,
+        segment_xy=segment_xy,
+        tail_tip=tail_tip,
+        remove_segment_from_edges=True,
+    )
 
-        annotated = best_frame.copy()
+    tail_loop_angle_deg = None
+    annotated = best_frame.copy()
 
-        # YOLO box
-        cv2.rectangle(annotated, (x1, y1), (x2, y2), (0, 255, 0), 2)
-        cv2.putText(
-            annotated,
-            f"{best_conf:.2f}",
-            (x1, y1 - 10),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.7,
-            (0, 255, 0),
-            2,
-        )
-        cv2.circle(annotated, tail_pt, 6, (0, 255, 255), -1)
+    x1, y1, x2, y2 = best_box
+    cv2.rectangle(annotated, (x1, y1), (x2, y2), (0, 255, 0), 2)
+    cv2.putText(
+        annotated,
+        f"{best_conf:.2f}",
+        (x1, y1 - 10),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.7,
+        (0, 255, 0),
+        2,
+    )
 
-        # Linear body reference
-        if body_method == "hardcoded_polyline":
-            draw_polyline(annotated, BODY_POLYLINE_POINTS, color=(255, 0, 0), thickness=2)
+    draw_segment_outline(annotated, segment_xy, color=(0, 255, 255), thickness=2)
+    cv2.circle(annotated, tail_pt, 6, (0, 255, 255), -1)
 
-        if body_x is not None:
-            signed_offset_x_px = float(tail_cx - body_x)
-            abs_offset_x_px = float(abs(signed_offset_x_px))
+    if tail_base is not None:
+        base_pt = (int(round(tail_base[0])), int(round(tail_base[1])))
+        cv2.circle(annotated, base_pt, 5, (255, 180, 0), -1)
 
-            body_pt = (int(round(body_x)), int(round(tail_cy)))
-            cv2.circle(annotated, body_pt, 6, (255, 0, 255), -1)
-            cv2.line(annotated, body_pt, tail_pt, (0, 165, 255), 2)
+    if seg_cent is not None:
+        seg_center_pt = (int(round(seg_cent[0])), int(round(seg_cent[1])))
+        cv2.circle(annotated, seg_center_pt, 5, (200, 255, 0), -1)
 
-            offset_text = f"offset_x={signed_offset_x_px:.1f}px ({body_method})"
+    if body_method == "hardcoded_polyline":
+        draw_polyline(annotated, BODY_POLYLINE_POINTS, color=(255, 0, 0), thickness=2)
+
+    if body_x is not None:
+        signed_offset_x_px = float(tail_cx - body_x)
+        abs_offset_x_px = float(abs(signed_offset_x_px))
+
+        body_pt = (int(round(body_x)), int(round(tail_cy)))
+        cv2.circle(annotated, body_pt, 6, (255, 0, 255), -1)
+        cv2.line(annotated, body_pt, tail_pt, (0, 165, 255), 2)
+
+    if loop_roi_box is not None:
+        draw_loop_search_roi(annotated, loop_roi_box)
+
+    if ellipse_info is not None:
+        draw_loop_ellipse(annotated, ellipse_info, color=(255, 255, 0), thickness=2)
+
+        cx, cy = ellipse_info["center"]
+        center_pt = (int(round(cx)), int(round(cy)))
+        cv2.line(annotated, center_pt, tail_pt, (255, 255, 0), 2)
+
+        tail_loop_angle_deg = point_to_ellipse_angle_deg((tail_cx, tail_cy), ellipse_info)
+        if tail_loop_angle_deg is not None:
+            angle_text = f"loop_angle={tail_loop_angle_deg:.1f} deg"
             cv2.putText(
                 annotated,
-                offset_text,
-                (tail_pt[0] + 10, tail_pt[1] - 10),
+                angle_text,
+                (tail_pt[0] + 10, tail_pt[1] + 20),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.7,
-                (0, 165, 255),
+                (255, 255, 0),
                 2,
             )
 
-        if loop_roi_box is not None:
-            draw_loop_search_roi(annotated, loop_roi_box)
+    img_path = os.path.join(save_path, f"tail_detected_{best_conf:.2f}.jpg")
+    cv2.imwrite(img_path, annotated)
+    print(f"Saved tail image: {img_path}")
 
-        # Ellipse reference
-        if ellipse_info is not None:
-            draw_loop_ellipse(annotated, ellipse_info, color=(255, 255, 0), thickness=2)
-
-            cx, cy = ellipse_info["center"]
-            center_pt = (int(round(cx)), int(round(cy)))
-            cv2.line(annotated, center_pt, tail_pt, (255, 255, 0), 2)
-
-            tail_loop_angle_deg = point_to_ellipse_angle_deg((tail_cx, tail_cy), ellipse_info)
-
-            if tail_loop_angle_deg is not None:
-                angle_text = f"loop_angle={tail_loop_angle_deg:.1f} deg"
-                cv2.putText(
-                    annotated,
-                    angle_text,
-                    (tail_pt[0] + 10, tail_pt[1] + 20),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.7,
-                    (255, 255, 0),
-                    2,
-                )
-
-        img_path = os.path.join(save_path, f"tail_detected_{best_conf:.2f}.jpg")
-        cv2.imwrite(img_path, annotated)
-        print(f"Saved tail image: {img_path}")
-
-        loop_json = None
-        if ellipse_info is not None:
-            loop_json = {
-                "ellipse_center": [
-                    round(float(ellipse_info["center"][0]), 2),
-                    round(float(ellipse_info["center"][1]), 2),
-                ],
-                "ellipse_axes_semi": [
-                    round(float(ellipse_info["axes"][0]), 2),
-                    round(float(ellipse_info["axes"][1]), 2),
-                ],
-                "ellipse_rotation_deg": round(float(ellipse_info["rotation_deg"]), 2),
-                "tail_loop_angle_deg_image_plane": None if tail_loop_angle_deg is None else round(float(tail_loop_angle_deg), 2),
-                "loop_search_roi": list(map(int, ellipse_info["roi_box"])),
-                "fit_metrics": None if ellipse_metrics is None else {
-                    "score": round(float(ellipse_metrics["score"]), 3),
-                    "center_to_polyline_dist": round(float(ellipse_metrics["center_to_polyline_dist"]), 2),
-                    "center_to_tail_dist": round(float(ellipse_metrics["center_to_tail_dist"]), 2),
-                    "tail_to_ellipse_boundary_dist": round(float(ellipse_metrics["tail_to_ellipse_boundary_dist"]), 2),
-                    "contour_support": round(float(ellipse_metrics["contour_support"]), 2),
-                }
+    seg_mask = polygon_to_mask(segment_xy, best_frame.shape)
+    loop_json = None
+    if ellipse_info is not None:
+        loop_json = {
+            "ellipse_center": [
+                round(float(ellipse_info["center"][0]), 2),
+                round(float(ellipse_info["center"][1]), 2),
+            ],
+            "ellipse_axes_semi": [
+                round(float(ellipse_info["axes"][0]), 2),
+                round(float(ellipse_info["axes"][1]), 2),
+            ],
+            "ellipse_rotation_deg": round(float(ellipse_info["rotation_deg"]), 2),
+            "tail_loop_angle_deg_image_plane": None if tail_loop_angle_deg is None else round(float(tail_loop_angle_deg), 2),
+            "loop_search_roi": list(map(int, ellipse_info["roi_box"])),
+            "fit_metrics": None if ellipse_metrics is None else {
+                "score": round(float(ellipse_metrics["score"]), 3),
+                "center_to_polyline_dist": round(float(ellipse_metrics["center_to_polyline_dist"]), 2),
+                "center_to_tail_dist": round(float(ellipse_metrics["center_to_tail_dist"]), 2),
+                "tail_to_ellipse_boundary_dist": round(float(ellipse_metrics["tail_to_ellipse_boundary_dist"]), 2),
+                "contour_support": round(float(ellipse_metrics["contour_support"]), 2),
+                "ellipse_overlap_ratio": round(float(ellipse_metrics["ellipse_overlap_ratio"]), 4),
             }
-
-        label_info = {
-            "class_id": best_cls,
-            "confidence": round(best_conf, 4),
-            "bbox": best_box,
-            "tail_center": [round(float(tail_cx), 2), round(float(tail_cy), 2)],
-            "tail_point_used": "bbox_center",
-
-            "body_reference_method": body_method,
-            "body_polyline_points": BODY_POLYLINE_POINTS,
-            "body_x_at_tail_y": None if body_x is None else round(float(body_x), 2),
-            "signed_offset_x_px": None if signed_offset_x_px is None else round(float(signed_offset_x_px), 2),
-            "abs_offset_x_px": None if abs_offset_x_px is None else round(float(abs_offset_x_px), 2),
-
-            "final_loop_fit": loop_json,
-
-            "frame_shape": list(best_frame.shape),
         }
 
-        json_path = os.path.join(save_path, f"tail_detected_{best_conf:.2f}.json")
-        with open(json_path, "w") as f:
-            json.dump(label_info, f, indent=2)
-        print(f"Saved label info: {json_path}")
+    label_info = {
+        "class_id": best_cls,
+        "confidence": round(best_conf, 4),
+        "bbox": best_box,
+        "segment_point_count": int(len(segment_xy)),
+        "segment_area_px": int(np.count_nonzero(seg_mask)),
+        "tail_tip": [round(float(tail_cx), 2), round(float(tail_cy), 2)],
+        "tail_base": None if tail_base is None else [round(float(tail_base[0]), 2), round(float(tail_base[1]), 2)],
+        "segment_centroid": None if seg_cent is None else [round(float(seg_cent[0]), 2), round(float(seg_cent[1]), 2)],
+        "tail_point_used": "segment_tip_endpoint_from_major_axis",
+        "body_reference_method": body_method,
+        "body_polyline_points": BODY_POLYLINE_POINTS,
+        "body_x_at_tail_y": None if body_x is None else round(float(body_x), 2),
+        "signed_offset_x_px": None if signed_offset_x_px is None else round(float(signed_offset_x_px), 2),
+        "abs_offset_x_px": None if abs_offset_x_px is None else round(float(abs_offset_x_px), 2),
+        "final_loop_fit": loop_json,
+        "frame_shape": list(best_frame.shape),
+    }
+
+    json_path = os.path.join(save_path, f"tail_detected_{best_conf:.2f}.json")
+    with open(json_path, "w") as f:
+        json.dump(label_info, f, indent=2)
+    print(f"Saved label info: {json_path}")
+
 
 # -------------------------
 # Main processing loop
@@ -756,7 +889,6 @@ def process_rtsp_stream(rtsp_url, roi_points, sink: BaseSink | None = None, fps_
 
     graph_time = deque(maxlen=3000)
     graph_intensity = deque(maxlen=3000)
-    segment_starts = []
 
     try:
         while cap.isOpened():
@@ -791,8 +923,6 @@ def process_rtsp_stream(rtsp_url, roi_points, sink: BaseSink | None = None, fps_
                 print(f"Segment END at {segment_end:.2f}s")
 
                 if segment_duration >= 10:
-                    segment_starts.append(segment_start)
-
                     start_dt = datetime.now() - timedelta(seconds=segment_duration)
                     end_dt = datetime.now()
                     folder = create_timestamped_folder(start_dt, end_dt)
@@ -826,7 +956,7 @@ def process_rtsp_stream(rtsp_url, roi_points, sink: BaseSink | None = None, fps_
 
 if __name__ == "__main__":
     roi_points = [(677, 1288), (1325, 1418), (1425, 1171), (893, 1051)]
-    video_path = "temp/21_08_2025_P1-00.00.00.000-01.05.57.296.mov"
+    video_path = "out.mp4"
 
     gui = CvGuiSink(show_plot=True)
     # process_rtsp_stream(RTSP_URL, roi_points, sink=gui)
