@@ -152,8 +152,13 @@ ANCHOR_MAX_TOP_DRIFT_PX = 2.0
 
 # Thermal/polyline last-loop extraction. This is the production version of the
 # mask-tuner experiment: look near the conveyor centerline, score hot material
-# on ellipse rings, and explicitly exclude the YOLO tail segment.
-THERMAL_LOOP_RING_THICKNESS = 34
+# on a thin ellipse centerline, and explicitly exclude the YOLO tail segment.
+THERMAL_LOOP_OUTPUT_RING_THICKNESS = 22
+THERMAL_LOOP_CENTERLINE_THICKNESS = 3
+THERMAL_LOOP_MIN_OUTPUT_THICKNESS = 10
+THERMAL_LOOP_MAX_OUTPUT_THICKNESS = 28
+THERMAL_LOOP_MIN_SCORE_SIGMA = 5.0
+THERMAL_LOOP_MAX_SCORE_SIGMA = 14.0
 THERMAL_LOOP_ROI_HALF_WIDTH = 560
 THERMAL_LOOP_ROI_UP_FROM_TAIL = 130
 THERMAL_LOOP_ROI_DOWN_FROM_TAIL = 380
@@ -163,10 +168,24 @@ THERMAL_LOOP_CENTER_Y_STEP = 18
 THERMAL_LOOP_CENTER_X_OFFSETS = (-100, -50, 0, 50, 100)
 THERMAL_LOOP_AXIS_A_VALUES = (240, 280, 320, 380)
 THERMAL_LOOP_AXIS_B_VALUES = (90, 115, 140, 170)
-THERMAL_LOOP_ANGLE_VALUES = (-12, 0, 12)
-THERMAL_LOOP_MIN_RING_PIXELS = 500
+THERMAL_LOOP_AXIS_Y_SCALE = 0.18
+THERMAL_LOOP_ANGLE_OFFSETS = (-12.0, -6.0, 0.0, 6.0, 12.0)
+THERMAL_LOOP_MIN_CENTERLINE_PIXELS = 90
 THERMAL_LOOP_MIN_OBSERVED_PIXELS = 180
-THERMAL_LOOP_METHOD = "thermal_polyline_last_loop_ellipse"
+THERMAL_LOOP_MIN_CLOSE_SUPPORT_RATIO = 0.18
+THERMAL_LOOP_MIN_VISIBLE_RATIO = 0.52
+THERMAL_LOOP_SECTOR_COUNT = 12
+THERMAL_LOOP_MIN_SUPPORTED_SECTORS = 5
+THERMAL_LOOP_MIN_ACCEPTED_SCORE = 6.0
+THERMAL_LOOP_PREFERRED_AXES = (270.0, 145.0)
+THERMAL_LOOP_PREFERRED_ANGLE_DEG = 0.0
+THERMAL_LOOP_ANGLE_PRIOR_SIGMA_DEG = 10.0
+THERMAL_LOOP_REFINEMENT_STEPS = (
+    (12, 8, 12, 8, 2.0),
+    (4, 3, 4, 3, 0.75),
+)
+THERMAL_LOOP_PCA_MIN_PIXELS = 800
+THERMAL_LOOP_METHOD = "thermal_polyline_last_loop_ellipse_v2"
 
 
 # -------------------------
@@ -503,7 +522,7 @@ def find_tail_tip_from_segment(poly_xy, polyline_points):
     if dist_a is None or dist_b is None:
         return end_a, end_b
 
-    # Inverted from earlier rule to match current footage
+    # In this camera view, the endpoint nearer the conveyor polyline is the tail tip.
     if dist_a <= dist_b:
         tip = end_a
         base = end_b
@@ -893,7 +912,7 @@ def ellipse_params_to_mask(image_shape, ellipse_params):
     return mask
 
 
-def ellipse_params_outline_to_mask(image_shape, ellipse_params, thickness=THERMAL_LOOP_RING_THICKNESS):
+def ellipse_params_outline_to_mask(image_shape, ellipse_params, thickness=THERMAL_LOOP_OUTPUT_RING_THICKNESS):
     mask = np.zeros((image_shape[0], image_shape[1]), dtype=np.uint8)
     if ellipse_params is None:
         return mask
@@ -902,8 +921,15 @@ def ellipse_params_outline_to_mask(image_shape, ellipse_params, thickness=THERMA
     if axes[0] <= 0 or axes[1] <= 0:
         return mask
 
-    cv2.ellipse(mask, center, axes, angle, 0.0, 360.0, 255, int(thickness))
+    cv2.ellipse(mask, center, axes, angle, 0.0, 360.0, 255, max(1, int(round(thickness))))
     return mask
+
+
+def normalize_ellipse_angle_deg(angle_deg):
+    angle = float(angle_deg) % 180.0
+    if angle < 0.0:
+        angle += 180.0
+    return angle
 
 
 def ellipse_params_to_info(ellipse_params, method=THERMAL_LOOP_METHOD):
@@ -911,7 +937,7 @@ def ellipse_params_to_info(ellipse_params, method=THERMAL_LOOP_METHOD):
     return {
         "center": (float(center[0]), float(center[1])),
         "axes": (float(axes[0]), float(axes[1])),
-        "rotation_deg": float(angle),
+        "rotation_deg": float(normalize_ellipse_angle_deg(angle)),
         "method": method,
     }
 
@@ -979,19 +1005,182 @@ def build_last_loop_material_mask(frame, roi_mask, segment_mask=None, settings=N
     return material, heat, color_roi_mask
 
 
+def polyline_cross_axis_angle_deg(polyline_points, y):
+    pts = get_sorted_polyline(polyline_points)
+    if len(pts) < 2:
+        return 0.0
+
+    for i in range(len(pts) - 1):
+        x1, y1 = pts[i]
+        x2, y2 = pts[i + 1]
+        if y1 <= y <= y2 or y2 <= y <= y1:
+            tangent = math.degrees(math.atan2(float(y2 - y1), float(x2 - x1)))
+            return normalize_ellipse_angle_deg(tangent + 90.0)
+
+    # Clamp to the nearest segment outside the polyline y-range.
+    if y < pts[0][1]:
+        x1, y1 = pts[0]
+        x2, y2 = pts[1]
+    else:
+        x1, y1 = pts[-2]
+        x2, y2 = pts[-1]
+    tangent = math.degrees(math.atan2(float(y2 - y1), float(x2 - x1)))
+    return normalize_ellipse_angle_deg(tangent + 90.0)
+
+
+def estimate_material_axis_angle_deg(material_mask, roi_box, polyline_points, tail_tip):
+    fallback = polyline_cross_axis_angle_deg(polyline_points, float(tail_tip[1]))
+    if material_mask is None or roi_box is None:
+        return fallback, "polyline_cross_axis"
+
+    x1, y1, x2, y2 = roi_box
+    local = material_mask[y1:y2, x1:x2]
+    ys, xs = np.where(local > 0)
+    if len(xs) < THERMAL_LOOP_PCA_MIN_PIXELS:
+        return fallback, "polyline_cross_axis"
+
+    points = np.column_stack([xs.astype(np.float32), ys.astype(np.float32)])
+    mean = np.mean(points, axis=0)
+    centered = points - mean
+    cov = np.cov(centered.T)
+    eigvals, eigvecs = np.linalg.eigh(cov)
+    axis = eigvecs[:, int(np.argmax(eigvals))]
+    angle = math.degrees(math.atan2(float(axis[1]), float(axis[0])))
+    return normalize_ellipse_angle_deg(angle), "material_pca"
+
+
+def angle_candidates_from_footage(material_mask, roi_box, polyline_points, tail_tip):
+    base_angle, source = estimate_material_axis_angle_deg(material_mask, roi_box, polyline_points, tail_tip)
+    candidates = []
+    for offset in THERMAL_LOOP_ANGLE_OFFSETS:
+        angle = normalize_ellipse_angle_deg(base_angle + offset)
+        if all(angular_difference_deg(angle, existing) > 1.0 for existing in candidates):
+            candidates.append(angle)
+    return candidates, base_angle, source
+
+
+def estimate_material_width_px(material_mask, roi_box):
+    if material_mask is None or roi_box is None:
+        return THERMAL_LOOP_OUTPUT_RING_THICKNESS, 0.5 * THERMAL_LOOP_OUTPUT_RING_THICKNESS
+
+    x1, y1, x2, y2 = roi_box
+    local = np.where(material_mask[y1:y2, x1:x2] > 0, 255, 0).astype(np.uint8)
+    if np.count_nonzero(local) < THERMAL_LOOP_MIN_OBSERVED_PIXELS:
+        return THERMAL_LOOP_OUTPUT_RING_THICKNESS, 0.5 * THERMAL_LOOP_OUTPUT_RING_THICKNESS
+
+    dist_inside = cv2.distanceTransform(local, cv2.DIST_L2, 3)
+    values = dist_inside[local > 0]
+    if values.size == 0:
+        return THERMAL_LOOP_OUTPUT_RING_THICKNESS, 0.5 * THERMAL_LOOP_OUTPUT_RING_THICKNESS
+
+    half_width = float(np.percentile(values, 60))
+    thickness = int(round(2.0 * half_width + 4.0))
+    thickness = max(THERMAL_LOOP_MIN_OUTPUT_THICKNESS, min(THERMAL_LOOP_MAX_OUTPUT_THICKNESS, thickness))
+    sigma = max(THERMAL_LOOP_MIN_SCORE_SIGMA, min(THERMAL_LOOP_MAX_SCORE_SIGMA, 0.50 * float(thickness)))
+    return thickness, sigma
+
+
+def axis_candidates_for_y(center_y, tail_y):
+    rel = np.clip(
+        (float(center_y) - (float(tail_y) + THERMAL_LOOP_CENTER_Y_START)) /
+        max(1.0, THERMAL_LOOP_CENTER_Y_STOP - THERMAL_LOOP_CENTER_Y_START),
+        0.0,
+        1.0,
+    )
+    scale = 1.0 + THERMAL_LOOP_AXIS_Y_SCALE * (rel - 0.5)
+    candidates = []
+    seen = set()
+    for a in THERMAL_LOOP_AXIS_A_VALUES:
+        for b in THERMAL_LOOP_AXIS_B_VALUES:
+            axes = (max(1, int(round(a * scale))), max(1, int(round(b * scale))))
+            if axes not in seen:
+                seen.add(axes)
+                candidates.append(axes)
+    return candidates
+
+
+def ellipse_sector_support(
+    centerline_bool,
+    valid_bool,
+    close_support,
+    local_ellipse,
+    sector_count=THERMAL_LOOP_SECTOR_COUNT,
+):
+    ys, xs = np.where(centerline_bool)
+    if len(xs) == 0:
+        return 0, [], []
+
+    (cx, cy), (a, b), angle = local_ellipse
+    theta = math.radians(float(angle))
+    cos_t = math.cos(theta)
+    sin_t = math.sin(theta)
+    dx = xs.astype(np.float32) - float(cx)
+    dy = ys.astype(np.float32) - float(cy)
+    local_x = cos_t * dx + sin_t * dy
+    local_y = -sin_t * dx + cos_t * dy
+    params = np.mod(
+        np.arctan2(local_y / max(1.0, float(b)), local_x / max(1.0, float(a))),
+        2.0 * math.pi,
+    )
+    sector_ids = np.minimum(
+        int(sector_count) - 1,
+        (params * float(sector_count) / (2.0 * math.pi)).astype(np.int32),
+    )
+
+    valid_values = valid_bool[ys, xs]
+    close_values = np.zeros(len(xs), dtype=bool)
+    close_values[valid_values] = close_support
+    sector_ratios = []
+    sector_valid_pixels = []
+    supported = 0
+    for sector in range(int(sector_count)):
+        in_sector = sector_ids == sector
+        valid_count = int(np.count_nonzero(in_sector & valid_values))
+        close_count = int(np.count_nonzero(in_sector & close_values))
+        ratio = close_count / float(max(1, valid_count))
+        sector_valid_pixels.append(valid_count)
+        sector_ratios.append(float(ratio))
+        if valid_count >= 12 and ratio >= 0.35:
+            supported += 1
+    return int(supported), sector_ratios, sector_valid_pixels
+
+
+def ellipse_offset_contrast(local_shape, local_ellipse, valid_region, local_material, offset_px):
+    (cx, cy), (a, b), angle = local_ellipse
+    occupancies = []
+    for direction in (-1.0, 1.0):
+        offset_axes = (
+            max(1, int(round(float(a) + direction * float(offset_px)))),
+            max(1, int(round(float(b) + direction * float(offset_px)))),
+        )
+        offset_mask = ellipse_params_outline_to_mask(
+            local_shape,
+            ((cx, cy), offset_axes, angle),
+            thickness=THERMAL_LOOP_CENTERLINE_THICKNESS,
+        ) > 0
+        valid_offset = offset_mask & valid_region
+        valid_count = int(np.count_nonzero(valid_offset))
+        if valid_count >= THERMAL_LOOP_MIN_CENTERLINE_PIXELS:
+            occupancies.append(float(np.count_nonzero(valid_offset & local_material)) / valid_count)
+    return 0.0 if not occupancies else float(1.0 - np.mean(occupancies))
+
+
 def score_thermal_last_loop_ellipse(
     image_shape,
     heat,
     material_mask,
+    material_distance,
     exclusion_mask,
     ellipse_params,
     tail_tip,
+    output_thickness,
+    score_sigma,
     polyline_points=BODY_POLYLINE_POINTS,
     guide_mask=None,
 ):
     center, axes, angle = ellipse_params
     cx_i, cy_i = int(center[0]), int(center[1])
-    pad = int(max(axes) + THERMAL_LOOP_RING_THICKNESS + 6)
+    pad = int(max(axes) + max(output_thickness, score_sigma) + 8)
     h, w = image_shape[:2]
     x1 = max(0, cx_i - pad)
     x2 = min(w, cx_i + pad + 1)
@@ -1002,22 +1191,52 @@ def score_thermal_last_loop_ellipse(
 
     local_shape = (y2 - y1, x2 - x1)
     local_ellipse = ((cx_i - x1, cy_i - y1), axes, angle)
-    ring_mask = ellipse_params_outline_to_mask(local_shape, local_ellipse)
-    ring_bool = ring_mask > 0
-    ring_count = int(np.count_nonzero(ring_bool))
-    if ring_count < THERMAL_LOOP_MIN_RING_PIXELS:
+    centerline_mask = ellipse_params_outline_to_mask(
+        local_shape,
+        local_ellipse,
+        thickness=THERMAL_LOOP_CENTERLINE_THICKNESS,
+    )
+    centerline_bool = centerline_mask > 0
+    centerline_count = int(np.count_nonzero(centerline_bool))
+    if centerline_count < THERMAL_LOOP_MIN_CENTERLINE_PIXELS:
         return None
 
     local_material = material_mask[y1:y2, x1:x2] > 0
     local_exclusion = exclusion_mask[y1:y2, x1:x2] > 0
-    observed_bool = ring_bool & local_material & ~local_exclusion
+    if np.count_nonzero(local_material) == 0:
+        return None
+
+    valid_centerline = centerline_bool & ~local_exclusion
+    valid_centerline_count = int(np.count_nonzero(valid_centerline))
+    visible_ratio = valid_centerline_count / float(centerline_count)
+    if (
+        valid_centerline_count < THERMAL_LOOP_MIN_CENTERLINE_PIXELS
+        or visible_ratio < THERMAL_LOOP_MIN_VISIBLE_RATIO
+    ):
+        return None
+
+    local_distance = material_distance[y1:y2, x1:x2]
+    line_distances = local_distance[valid_centerline]
+    close_support = line_distances <= float(score_sigma)
+    close_support_count = int(np.count_nonzero(close_support))
+    close_support_ratio = close_support_count / float(valid_centerline_count)
+    if close_support_count < THERMAL_LOOP_MIN_OBSERVED_PIXELS or close_support_ratio < THERMAL_LOOP_MIN_CLOSE_SUPPORT_RATIO:
+        return None
+
+    support_values = np.exp(-0.5 * (line_distances / max(1e-6, float(score_sigma))) ** 2)
+    support_score = float(np.mean(support_values))
+    mean_distance = float(np.mean(line_distances))
+
+    output_ring_mask = ellipse_params_outline_to_mask(local_shape, local_ellipse, thickness=output_thickness)
+    output_ring_bool = output_ring_mask > 0
+    valid_ring_bool = output_ring_bool & ~local_exclusion
+    observed_bool = valid_ring_bool & local_material
     observed_count = int(np.count_nonzero(observed_bool))
     if observed_count < THERMAL_LOOP_MIN_OBSERVED_PIXELS:
         return None
 
     fill_mask = ellipse_params_to_mask(local_shape, local_ellipse)
     fill_bool = fill_mask > 0
-    fill_count = max(1, int(np.count_nonzero(fill_bool)))
 
     cx, cy = float(center[0]), float(center[1])
     tail_y = float(tail_tip[1])
@@ -1034,11 +1253,26 @@ def score_thermal_last_loop_ellipse(
         poly_score = max(0.0, 1.0 - (float(poly_dist) / 260.0))
 
     local_heat = heat[y1:y2, x1:x2]
-    ring_coverage = observed_count / float(ring_count)
-    ring_heat = float(np.mean(local_heat[observed_bool]))
-    fill_material = int(np.count_nonzero(fill_bool & local_material & ~local_exclusion))
-    fill_density = fill_material / float(fill_count)
-    exclusion_overlap = int(np.count_nonzero(ring_bool & local_exclusion)) / float(ring_count)
+    supported_line_heat = float(np.mean(local_heat[valid_centerline][close_support]))
+    valid_fill = fill_bool & ~local_exclusion
+    valid_fill_count = max(1, int(np.count_nonzero(valid_fill)))
+    fill_material = int(np.count_nonzero(valid_fill & local_material))
+    fill_density = fill_material / float(valid_fill_count)
+    exclusion_overlap = int(np.count_nonzero(output_ring_bool & local_exclusion)) / float(max(1, np.count_nonzero(output_ring_bool)))
+    supported_sectors, sector_support_ratios, sector_valid_pixels = ellipse_sector_support(
+        centerline_bool,
+        valid_centerline,
+        close_support,
+        local_ellipse,
+    )
+    sector_score = supported_sectors / float(THERMAL_LOOP_SECTOR_COUNT)
+    offset_contrast = ellipse_offset_contrast(
+        local_shape,
+        local_ellipse,
+        ~local_exclusion,
+        local_material,
+        offset_px=max(12.0, float(output_thickness)),
+    )
 
     guide_score = 0.0
     if guide_mask is not None:
@@ -1048,35 +1282,101 @@ def score_thermal_last_loop_ellipse(
             guide_score = np.count_nonzero(fill_bool & local_guide) / float(union)
 
     a, b = axes
+    preferred_a, preferred_b = THERMAL_LOOP_PREFERRED_AXES
     aspect = float(a) / max(1.0, float(b))
-    aspect_score = max(0.0, 1.0 - abs(aspect - 2.6) / 2.4)
+    preferred_aspect = preferred_a / preferred_b
+    aspect_score = max(0.0, 1.0 - abs(aspect - preferred_aspect) / 1.5)
+    axis_prior_score = math.exp(
+        -0.5 * (((float(a) - preferred_a) / 90.0) ** 2 + ((float(b) - preferred_b) / 55.0) ** 2)
+    )
+    angle_error_deg = angular_difference_deg(float(angle), THERMAL_LOOP_PREFERRED_ANGLE_DEG)
+    angle_prior_score = math.exp(-0.5 * (angle_error_deg / THERMAL_LOOP_ANGLE_PRIOR_SIGMA_DEG) ** 2)
 
     score = (
-        3.0 * ring_coverage +
-        1.8 * ring_heat +
+        3.4 * support_score +
+        1.8 * close_support_ratio +
+        1.5 * supported_line_heat +
         0.8 * min(1.0, fill_density * 4.0) +
-        1.0 * poly_score +
-        0.85 * topness +
+        0.3 * poly_score +
+        0.5 * topness +
         0.35 * aspect_score +
+        0.8 * axis_prior_score +
+        0.5 * angle_prior_score +
+        0.9 * sector_score +
+        0.55 * offset_contrast +
         1.4 * guide_score -
-        2.5 * exclusion_overlap
+        0.04 * mean_distance
     )
 
+    accepted = bool(
+        score >= THERMAL_LOOP_MIN_ACCEPTED_SCORE
+        and supported_sectors >= THERMAL_LOOP_MIN_SUPPORTED_SECTORS
+        and visible_ratio >= THERMAL_LOOP_MIN_VISIBLE_RATIO
+    )
     return {
         "score": float(score),
-        "accepted": True,
+        "accepted": accepted,
         "candidate_type": "thermal_polyline_last_loop",
-        "ring_coverage": float(ring_coverage),
-        "ring_heat": float(ring_heat),
+        "centerline_support_score": float(support_score),
+        "centerline_close_ratio": float(close_support_ratio),
+        "centerline_mean_dist_px": float(mean_distance),
+        "ring_coverage": float(close_support_ratio),
+        "ring_heat": float(supported_line_heat),
         "fill_density": float(fill_density),
         "center_to_polyline_dist": None if poly_dist is None else float(poly_dist),
         "polyline_score": float(poly_score),
         "topness": float(topness),
         "exclusion_overlap": float(exclusion_overlap),
+        "visible_centerline_ratio": float(visible_ratio),
+        "supported_sector_count": int(supported_sectors),
+        "sector_support_ratios": sector_support_ratios,
+        "sector_valid_pixels": sector_valid_pixels,
+        "offset_contrast": float(offset_contrast),
+        "axis_prior_score": float(axis_prior_score),
+        "angle_prior_score": float(angle_prior_score),
+        "angle_error_from_prior_deg": float(angle_error_deg),
         "guide_iou": float(guide_score),
         "observed_pixels": int(observed_count),
-        "ring_pixels": int(ring_count),
+        "centerline_pixels": int(centerline_count),
+        "valid_centerline_pixels": int(valid_centerline_count),
+        "ring_pixels": int(np.count_nonzero(output_ring_bool)),
+        "output_ring_thickness_px": int(output_thickness),
+        "score_sigma_px": float(score_sigma),
     }
+
+
+def refine_thermal_last_loop_ellipse(best, score_candidate):
+    if best is None:
+        return None, 0
+
+    refinement_candidates = 0
+    for center_dx, center_dy, axis_da, axis_db, angle_delta in THERMAL_LOOP_REFINEMENT_STEPS:
+        improved = True
+        while improved:
+            improved = False
+            (cx, cy), (a, b), angle = best["ellipse"]
+            neighbors = (
+                ((cx - center_dx, cy), (a, b), angle),
+                ((cx + center_dx, cy), (a, b), angle),
+                ((cx, cy - center_dy), (a, b), angle),
+                ((cx, cy + center_dy), (a, b), angle),
+                ((cx, cy), (a - axis_da, b), angle),
+                ((cx, cy), (a + axis_da, b), angle),
+                ((cx, cy), (a, b - axis_db), angle),
+                ((cx, cy), (a, b + axis_db), angle),
+                ((cx, cy), (a, b), normalize_ellipse_angle_deg(angle - angle_delta)),
+                ((cx, cy), (a, b), normalize_ellipse_angle_deg(angle + angle_delta)),
+            )
+            for ellipse in neighbors:
+                if ellipse[1][0] <= 1 or ellipse[1][1] <= 1:
+                    continue
+                metrics = score_candidate(ellipse)
+                refinement_candidates += 1
+                if metrics is not None and metrics["score"] > best["metrics"]["score"] + 1e-6:
+                    best = {"ellipse": ellipse, "metrics": metrics}
+                    improved = True
+                    break
+    return best, refinement_candidates
 
 
 def build_last_loop_mask_from_geometry(
@@ -1118,11 +1418,39 @@ def build_last_loop_mask_from_geometry(
     exclusion_mask = cv2.bitwise_or(tail_exclusion, segment_exclusion)
     material_mask = material_mask.copy()
     material_mask[exclusion_mask > 0] = 0
+    material_distance = cv2.distanceTransform(
+        np.where(material_mask > 0, 0, 255).astype(np.uint8),
+        cv2.DIST_L2,
+        3,
+    )
+
+    output_thickness, score_sigma = estimate_material_width_px(material_mask, roi_box)
+    angle_candidates, base_angle, angle_source = angle_candidates_from_footage(
+        material_mask,
+        roi_box,
+        polyline_points,
+        tail_tip,
+    )
 
     guide_mask = None if guide_ellipse is None else ellipse_params_to_mask(frame.shape, guide_ellipse)
     tail_x, tail_y = float(tail_tip[0]), float(tail_tip[1])
     best = None
     candidates_scored = 0
+
+    def score_candidate(ellipse):
+        return score_thermal_last_loop_ellipse(
+            frame.shape,
+            heat,
+            material_mask,
+            material_distance,
+            exclusion_mask,
+            ellipse,
+            tail_tip,
+            output_thickness=output_thickness,
+            score_sigma=score_sigma,
+            polyline_points=polyline_points,
+            guide_mask=guide_mask,
+        )
 
     for dy in range(THERMAL_LOOP_CENTER_Y_START, THERMAL_LOOP_CENTER_Y_STOP + 1, THERMAL_LOOP_CENTER_Y_STEP):
         cy = int(round(tail_y + dy))
@@ -1133,31 +1461,25 @@ def build_last_loop_mask_from_geometry(
         if body_x is None:
             body_x = tail_x
 
+        axis_candidates = axis_candidates_for_y(cy, tail_y)
         for x_offset in THERMAL_LOOP_CENTER_X_OFFSETS:
             cx = int(round(body_x + x_offset))
             if cx < 0 or cx >= frame.shape[1]:
                 continue
 
-            for a in THERMAL_LOOP_AXIS_A_VALUES:
-                for b in THERMAL_LOOP_AXIS_B_VALUES:
-                    for angle in THERMAL_LOOP_ANGLE_VALUES:
-                        ellipse = ((cx, cy), (int(a), int(b)), float(angle))
-                        metrics = score_thermal_last_loop_ellipse(
-                            frame.shape,
-                            heat,
-                            material_mask,
-                            exclusion_mask,
-                            ellipse,
-                            tail_tip,
-                            polyline_points=polyline_points,
-                            guide_mask=guide_mask,
-                        )
-                        if metrics is None:
-                            continue
+            for axes in axis_candidates:
+                for angle in angle_candidates:
+                    ellipse = ((cx, cy), axes, float(angle))
+                    metrics = score_candidate(ellipse)
+                    if metrics is None:
+                        continue
 
-                        candidates_scored += 1
-                        if best is None or metrics["score"] > best["metrics"]["score"]:
-                            best = {"ellipse": ellipse, "metrics": metrics}
+                    candidates_scored += 1
+                    if best is None or metrics["score"] > best["metrics"]["score"]:
+                        best = {"ellipse": ellipse, "metrics": metrics}
+
+    best, refinement_candidates = refine_thermal_last_loop_ellipse(best, score_candidate)
+    candidates_scored += refinement_candidates
 
     heat_vis = np.clip(heat * 255.0, 0, 255).astype(np.uint8)
     debug = {
@@ -1168,6 +1490,7 @@ def build_last_loop_mask_from_geometry(
         "material_mask": material_mask,
         "tail_exclusion_mask": tail_exclusion,
         "exclusion_mask": exclusion_mask,
+        "selected_loop_centerline_mask": np.zeros(frame.shape[:2], dtype=np.uint8),
         "selected_loop_ring_mask": np.zeros(frame.shape[:2], dtype=np.uint8),
         "selected_loop_fill_mask": np.zeros(frame.shape[:2], dtype=np.uint8),
         "observed_loop_mask": np.zeros(frame.shape[:2], dtype=np.uint8),
@@ -1175,12 +1498,32 @@ def build_last_loop_mask_from_geometry(
         "best_ellipse_info": None,
         "best_metrics": None,
         "candidates_scored": int(candidates_scored),
+        "dynamic_ring_thickness_px": int(output_thickness),
+        "score_sigma_px": float(score_sigma),
+        "angle_base_deg": float(base_angle),
+        "angle_source": angle_source,
+        "angle_candidates_deg": [float(a) for a in angle_candidates],
     }
 
     if best is None:
         return None, debug
 
-    ring_mask = ellipse_params_outline_to_mask(frame.shape, best["ellipse"])
+    best["metrics"].update({
+        "method": THERMAL_LOOP_METHOD,
+        "roi_box": roi_box,
+        "candidate_count": int(candidates_scored),
+        "dynamic_ring_thickness_px": int(output_thickness),
+        "angle_base_deg": float(base_angle),
+        "angle_source": angle_source,
+        "angle_candidates_deg": [float(a) for a in angle_candidates],
+    })
+
+    centerline_mask = ellipse_params_outline_to_mask(
+        frame.shape,
+        best["ellipse"],
+        thickness=THERMAL_LOOP_CENTERLINE_THICKNESS,
+    )
+    ring_mask = ellipse_params_outline_to_mask(frame.shape, best["ellipse"], thickness=output_thickness)
     fill_mask = ellipse_params_to_mask(frame.shape, best["ellipse"])
     observed_mask = cv2.bitwise_and(ring_mask, material_mask)
     observed_mask[exclusion_mask > 0] = 0
@@ -1188,6 +1531,7 @@ def build_last_loop_mask_from_geometry(
     ellipse_info = ellipse_params_to_info(best["ellipse"])
     ellipse_info["roi_box"] = roi_box
 
+    debug["selected_loop_centerline_mask"] = centerline_mask
     debug["selected_loop_ring_mask"] = ring_mask
     debug["selected_loop_fill_mask"] = fill_mask
     debug["observed_loop_mask"] = observed_mask
@@ -2080,6 +2424,139 @@ def ellipse_anchor_points(ellipse_info, polyline_points=None, step_deg=2):
     }
 
 
+def compute_ellipse_polyline_distance(
+    ellipse_info,
+    segment_xy,
+    image_shape,
+    polyline_points,
+    tail_hint=None,
+    samples=180,
+    max_search=1200,
+):
+    """
+    Find the ellipse boundary point nearest the supplied polyline and measure
+    the distance from that ellipse point to the provided segment (tail body)
+    along the local polyline direction.
+
+    Returns a dict with keys:
+      - ellipse_point: (x,y) on ellipse nearest the polyline
+      - polyline_distance_px: distance from that ellipse point to the polyline
+      - distance_along_polyline_px: distance from the ellipse point along the
+        polyline direction to the first pixel of the supplied segment mask
+        (None if no intersection within `max_search`)
+      - intersection_point: (x,y) on the segment where the line hits (or None)
+      - euclidean_distance_px: straight-line distance to the nearest segment pixel
+    """
+    if ellipse_info is None or segment_xy is None or image_shape is None:
+        return None
+
+    # 1) Find ellipse point closest to the polyline by sampling angles
+    # Prefer the upper half (top) of the ellipse relative to its center.
+    best_pt = None
+    best_poly_dist = float("inf")
+    cx, cy = ellipse_info["center"]
+    # first pass: only consider top half (y <= center_y)
+    for angle in np.linspace(0.0, 360.0, samples, endpoint=False):
+        pt = ellipse_point_at_angle(ellipse_info, angle)
+        if pt is None:
+            continue
+        # prefer top hemisphere
+        if pt[1] > cy:
+            continue
+        d_poly = point_to_polyline_distance(pt[0], pt[1], polyline_points)
+        if d_poly is None:
+            continue
+        if d_poly < best_poly_dist:
+            best_poly_dist = d_poly
+            best_pt = pt
+
+    # fallback: if no top-half candidate, use full circumference
+    if best_pt is None:
+        for angle in np.linspace(0.0, 360.0, samples, endpoint=False):
+            pt = ellipse_point_at_angle(ellipse_info, angle)
+            if pt is None:
+                continue
+            d_poly = point_to_polyline_distance(pt[0], pt[1], polyline_points)
+            if d_poly is None:
+                continue
+            if d_poly < best_poly_dist:
+                best_poly_dist = d_poly
+                best_pt = pt
+
+    if best_pt is None:
+        return None
+
+    ellipse_x, ellipse_y = float(best_pt[0]), float(best_pt[1])
+
+    # 2) Build a mask for the provided segment polygon
+    seg_mask = polygon_to_mask(segment_xy, image_shape)
+
+    # 3) Compute nearest Euclidean distance to the segment (for fallback / info)
+    ys, xs = np.where(seg_mask > 0)
+    euclid_dist = None
+    if len(xs) > 0:
+        dists = np.hypot(xs - ellipse_x, ys - ellipse_y)
+        euclid_dist = float(np.min(dists))
+
+    # 4) Estimate local polyline tangent (direction vector)
+    pts = get_sorted_polyline(polyline_points)
+    # find segment that spans ellipse_y
+    dir_vec = None
+    for i in range(len(pts) - 1):
+        x1, y1 = pts[i]
+        x2, y2 = pts[i + 1]
+        if (y1 <= ellipse_y <= y2) or (y2 <= ellipse_y <= y1):
+            dx = float(x2 - x1)
+            dy = float(y2 - y1)
+            norm = math.hypot(dx, dy)
+            if norm > 1e-6:
+                dir_vec = (dx / norm, dy / norm)
+            break
+    if dir_vec is None:
+        # fallback to overall polyline direction
+        x1, y1 = pts[0]
+        x2, y2 = pts[-1]
+        dx = float(x2 - x1)
+        dy = float(y2 - y1)
+        norm = math.hypot(dx, dy)
+        if norm > 1e-6:
+            dir_vec = (dx / norm, dy / norm)
+        else:
+            dir_vec = (1.0, 0.0)
+
+    ux, uy = dir_vec
+
+    # 5) Orient direction toward the segment (so search moves from ellipse -> tail)
+    cent = segment_centroid(segment_xy)
+    if cent is not None:
+        vx = cent[0] - ellipse_x
+        vy = cent[1] - ellipse_y
+        if (vx * ux + vy * uy) < 0:
+            ux, uy = -ux, -uy
+
+    # 6) March from ellipse point along (ux,uy) until we hit the segment mask
+    h, w = image_shape[:2]
+    intersection = None
+    distance_along = None
+    for step in range(0, int(max_search) + 1):
+        sx = int(round(ellipse_x + ux * step))
+        sy = int(round(ellipse_y + uy * step))
+        if sx < 0 or sx >= w or sy < 0 or sy >= h:
+            break
+        if seg_mask[sy, sx] > 0:
+            intersection = (float(sx), float(sy))
+            distance_along = float(step)
+            break
+
+    return {
+        "ellipse_point": (float(ellipse_x), float(ellipse_y)),
+        "polyline_distance_px": float(best_poly_dist),
+        "distance_along_polyline_px": distance_along,
+        "intersection_point": intersection,
+        "euclidean_distance_px": euclid_dist,
+    }
+
+
 def mask_distance_transform(mask):
     if mask is None or mask.size == 0:
         return None
@@ -2726,6 +3203,38 @@ def select_final_loop_model(frame, segment_xy, tail_tip, tail_base=None, bbox=No
         polyline_points=BODY_POLYLINE_POINTS,
     )
 
+    thermal_accepted = thermal_ellipse is not None and thermal_metrics is not None and thermal_metrics.get("accepted", False)
+    if thermal_accepted:
+        thermal_ellipse["roi_box"] = thermal_roi_box
+        thermal_ellipse["method"] = THERMAL_LOOP_METHOD
+        return thermal_ellipse, thermal_metrics, {
+            "roi_box": thermal_roi_box,
+            "candidate_mask": thermal_mask,
+            "debug_masks": {},
+            "thermal": {
+                "ellipse": thermal_ellipse,
+                "metrics": thermal_metrics,
+                "candidate_mask": thermal_mask,
+                "roi_box": thermal_roi_box,
+                "debug_masks": thermal_debug,
+            },
+            "direct": {
+                "ellipse": None,
+                "metrics": None,
+                "candidate_mask": None,
+                "roi_box": None,
+                "candidate_count": 0,
+                "candidates": [],
+                "skipped_reason": "thermal_polyline_selected",
+            },
+            "anchor_guided": {
+                "ellipse": None,
+                "metrics": None,
+            },
+            "chosen_method": THERMAL_LOOP_METHOD,
+            "selection_reason": "thermal_polyline_selected",
+        }
+
     direct_ellipse, direct_candidate_mask, direct_roi_box, direct_metrics, debug_masks = fit_final_loop_ellipse_from_segment(
         frame,
         segment_xy=segment_xy,
@@ -2757,17 +3266,8 @@ def select_final_loop_model(frame, segment_xy, tail_tip, tail_base=None, bbox=No
     chosen_candidate_mask = direct_candidate_mask
     selection_reason = None
 
-    thermal_accepted = thermal_ellipse is not None and thermal_metrics is not None and thermal_metrics.get("accepted", False)
     direct_accepted = direct_ellipse is not None and direct_metrics is not None and direct_metrics.get("accepted", False)
-
-    if thermal_accepted:
-        chosen_ellipse = thermal_ellipse
-        chosen_metrics = thermal_metrics
-        chosen_method = THERMAL_LOOP_METHOD
-        chosen_roi_box = thermal_roi_box
-        chosen_candidate_mask = thermal_mask
-        selection_reason = "thermal_polyline_selected"
-    elif (
+    if (
         direct_ellipse is not None
         and direct_ellipse.get("method") in ("last_loop_direct_hole_ellipse", "last_loop_opening_band_ellipse", "last_loop_direct_arc_ellipse")
         and direct_accepted
@@ -2940,6 +3440,7 @@ def save_loop_fit_diagnostics(debug_dir, frame, segment_xy, tail_tip, tail_base,
     save_debug_image(debug_dir / "06i_thermal_exclusion_mask.png", mask_to_vis(thermal_debug.get("exclusion_mask")))
     save_debug_image(debug_dir / "06j_thermal_selected_ring.png", mask_to_vis(thermal_debug.get("selected_loop_ring_mask")))
     save_debug_image(debug_dir / "06k_thermal_observed_loop.png", mask_to_vis(thermal_info.get("candidate_mask")))
+    save_debug_image(debug_dir / "06m_thermal_centerline.png", mask_to_vis(thermal_debug.get("selected_loop_centerline_mask")))
 
     thermal_overlay = base_overlay.copy()
     thermal_mask = thermal_info.get("candidate_mask")
