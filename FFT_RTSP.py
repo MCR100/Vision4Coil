@@ -2,6 +2,7 @@ import cv2
 import numpy as np
 import os
 import json
+import shutil
 from datetime import timedelta, datetime
 import plotly.graph_objects as go
 import matplotlib.pyplot as plt
@@ -30,6 +31,7 @@ from coil_cv import (
     segment_centroid,
     select_final_loop_model,
     select_loop_accumulation_frames,
+    compute_ellipse_polyline_distance,
 )
 
 # ----- CONFIG -----
@@ -45,6 +47,9 @@ OUTPUT_DIR = Path("output")
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 DEBUG_SAVE_INTERMEDIATE = True
+MIN_SEGMENT_DURATION_SECONDS = 10.0
+SEGMENT_FRAME_BUFFER_SIZE = 30  # Keep the last N frames for CV and label capture output.
+CAPTURE_JPEG_QUALITY = 90
 
 # --------------
 # Sink interface
@@ -180,6 +185,95 @@ def save_results_html(time_axis, intensity_values, save_path):
     print(f"Saved: {html_file}")
 
 
+class ActiveCaptureWriter:
+    def __init__(
+        self,
+        source,
+        roi_points,
+        fps,
+        segment_start,
+        max_frames=SEGMENT_FRAME_BUFFER_SIZE,
+    ):
+        self.source = source
+        self.roi_points = roi_points
+        self.fps = float(fps)
+        self.segment_start = float(segment_start)
+        self.max_frames = max(1, int(max_frames))
+        self.capture_frames = deque(maxlen=self.max_frames)
+        self.detection_frames = deque(maxlen=self.max_frames)
+        self.image_shape = None
+
+    def append(self, frame, t_s, intensity, source_frame_index):
+        if self.image_shape is None:
+            self.image_shape = list(frame.shape)
+
+        self.detection_frames.append(frame.copy())
+
+        ok, jpg = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), int(CAPTURE_JPEG_QUALITY)])
+        if not ok:
+            return
+
+        self.capture_frames.append({
+            "source_frame_index": int(source_frame_index),
+            "t_s": round(float(t_s), 4),
+            "fft_intensity": round(float(intensity), 4),
+            "jpg_bytes": jpg.tobytes(),
+        })
+
+    def detection_frame_list(self):
+        return list(self.detection_frames)
+
+    def finalize(self, save_path, segment_end):
+        capture_dir = Path(save_path)
+        capture_dir.mkdir(parents=True, exist_ok=True)
+        labels_dir = capture_dir / "labels"
+        labels_dir.mkdir(parents=True, exist_ok=True)
+
+        final_frames_dir = capture_dir / "frames"
+        if final_frames_dir.exists():
+            shutil.rmtree(final_frames_dir)
+        final_frames_dir.mkdir(parents=True, exist_ok=True)
+
+        records = []
+        for index, item in enumerate(self.capture_frames):
+            filename = f"frame_{index:06d}.jpg"
+            rel_path = f"frames/{filename}"
+            (final_frames_dir / filename).write_bytes(item["jpg_bytes"])
+            records.append({
+                "index": index,
+                "source_frame_index": item["source_frame_index"],
+                "path": rel_path,
+                "t_s": item["t_s"],
+                "fft_intensity": item["fft_intensity"],
+            })
+
+        manifest = {
+            "schema_version": 1,
+            "capture_id": capture_dir.name,
+            "capture_dir": str(capture_dir),
+            "source": self.source,
+            "threshold": float(THRESHOLD),
+            "fps": self.fps,
+            "segment_frame_buffer_size": self.max_frames,
+            "roi_points": [[int(x), int(y)] for x, y in self.roi_points],
+            "segment_start_s": round(float(self.segment_start), 4),
+            "segment_end_s": round(float(segment_end), 4),
+            "segment_duration_s": round(float(segment_end - self.segment_start), 4),
+            "frame_count": len(records),
+            "frame_shape": self.image_shape,
+            "frames": records,
+            "label_source_of_truth": "labels/true_ellipse.json",
+        }
+
+        manifest_path = capture_dir / "manifest.json"
+        manifest_path.write_text(json.dumps(manifest, indent=2))
+        print(f"Saved capture manifest: {manifest_path}")
+
+    def discard(self):
+        self.capture_frames.clear()
+        self.detection_frames.clear()
+
+
 # -------------------------
 # Detection + save
 # -------------------------
@@ -217,6 +311,8 @@ def detect_tail_and_save(frames, roi_points, save_path, conf_thresh=0.6):
     body_x, body_method = choose_body_reference(best_frame, best_box, tail_cy)
     signed_offset_x_px = None
     abs_offset_x_px = None
+
+    dist_info = None
 
     ellipse_info, ellipse_metrics, loop_diagnostics = select_final_loop_model(
         best_frame,
@@ -265,6 +361,35 @@ def detect_tail_and_save(frames, roi_points, save_path, conf_thresh=0.6):
                 (255, 255, 0),
                 2,
             )
+
+        # compute distance from ellipse boundary (nearest to polyline) to segment
+        try:
+            dist_info = compute_ellipse_polyline_distance(
+                ellipse_info, segment_xy, best_frame.shape, BODY_POLYLINE_POINTS
+            )
+        except Exception:
+            dist_info = None
+
+        if dist_info is not None:
+            ep = dist_info.get("ellipse_point")
+            inter = dist_info.get("intersection_point")
+            d_along = dist_info.get("distance_along_polyline_px")
+            euclid = dist_info.get("euclidean_distance_px")
+            if ep is not None:
+                epx, epy = int(round(ep[0])), int(round(ep[1]))
+                cv2.circle(annotated, (epx, epy), 4, (0, 255, 255), -1)
+            if inter is not None:
+                ipx, ipy = int(round(inter[0])), int(round(inter[1]))
+                cv2.circle(annotated, (ipx, ipy), 4, (0, 200, 200), -1)
+                if ep is not None:
+                    cv2.line(annotated, (epx, epy), (ipx, ipy), (0, 255, 255), 2)
+            # annotate distance text next to tail
+            d_display = d_along if d_along is not None else euclid
+            if d_display is not None:
+                txt = f"d_px={d_display:.1f}"
+                cv2.putText(annotated, txt, (tail_pt[0] + 6, tail_pt[1] + 6), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+        else:
+            dist_info = None
 
     img_path = os.path.join(save_path, f"tail_detected_{best_conf:.2f}.jpg")
     cv2.imwrite(img_path, annotated)
@@ -348,6 +473,24 @@ def detect_tail_and_save(frames, roi_points, save_path, conf_thresh=0.6):
         "frame_shape": list(best_frame.shape),
     }
 
+    # attach polyline-based ellipse->tail distance info if available
+    if dist_info is None:
+        label_info["tail_to_ellipse_polyline"] = None
+    else:
+        label_info["tail_to_ellipse_polyline"] = {
+            "ellipse_point": None if dist_info.get("ellipse_point") is None else [
+                round(float(dist_info["ellipse_point"][0]), 2),
+                round(float(dist_info["ellipse_point"][1]), 2),
+            ],
+            "intersection_point": None if dist_info.get("intersection_point") is None else [
+                round(float(dist_info["intersection_point"][0]), 2),
+                round(float(dist_info["intersection_point"][1]), 2),
+            ],
+            "distance_along_polyline_px": None if dist_info.get("distance_along_polyline_px") is None else round(float(dist_info["distance_along_polyline_px"]), 2),
+            "euclidean_distance_px": None if dist_info.get("euclidean_distance_px") is None else round(float(dist_info["euclidean_distance_px"]), 2),
+            "polyline_distance_px": None if dist_info.get("polyline_distance_px") is None else round(float(dist_info["polyline_distance_px"]), 2),
+        }
+
     json_path = os.path.join(save_path, f"tail_detected_{best_conf:.2f}.json")
     with open(json_path, "w") as f:
         json.dump(label_info, f, indent=2)
@@ -388,7 +531,7 @@ def process_rtsp_stream(rtsp_url, roi_points, sink: BaseSink | None = None, fps_
     in_segment = False
     segment_start = None
 
-    segment_frames = deque(maxlen=60)
+    active_capture = None
     segment_time = []
     segment_intensities = []
 
@@ -416,7 +559,9 @@ def process_rtsp_stream(rtsp_url, roi_points, sink: BaseSink | None = None, fps_
             if not in_segment and intensity > THRESHOLD:
                 in_segment = True
                 segment_start = round(current_time, 2)
-                segment_frames.clear()
+                if active_capture is not None:
+                    active_capture.discard()
+                active_capture = ActiveCaptureWriter(rtsp_url, roi_points, fps, segment_start)
                 segment_time = []
                 segment_intensities = []
                 print(f"Segment START at {segment_start:.2f}s")
@@ -427,24 +572,27 @@ def process_rtsp_stream(rtsp_url, roi_points, sink: BaseSink | None = None, fps_
                 segment_duration = segment_end - segment_start
                 print(f"Segment END at {segment_end:.2f}s")
 
-                if segment_duration >= 10:
+                if segment_duration >= MIN_SEGMENT_DURATION_SECONDS:
                     start_dt = datetime.now() - timedelta(seconds=segment_duration)
                     end_dt = datetime.now()
                     folder = create_timestamped_folder(start_dt, end_dt)
                     base = os.path.join(folder, os.path.basename(folder))
                     save_results_txt(segment_time, segment_intensities, base)
                     save_results_html(segment_time, segment_intensities, base)
-
-                    detect_tail_and_save(list(segment_frames), roi_points, folder)
+                    if active_capture is not None:
+                        active_capture.finalize(folder, segment_end)
+                        detect_tail_and_save(active_capture.detection_frame_list(), roi_points, folder)
                 else:
                     print(f"Segment duration {segment_duration:.2f}s too short. Skipped.")
+                    if active_capture is not None:
+                        active_capture.discard()
 
-                segment_frames.clear()
+                active_capture = None
                 segment_time.clear()
                 segment_intensities.clear()
 
-            if in_segment:
-                segment_frames.append(frame.copy())
+            if in_segment and active_capture is not None:
+                active_capture.append(frame, current_time, float(intensity), frame_idx)
                 segment_time.append(current_time)
                 segment_intensities.append(float(intensity))
 
@@ -454,6 +602,8 @@ def process_rtsp_stream(rtsp_url, roi_points, sink: BaseSink | None = None, fps_
             frame_idx += 1
 
     finally:
+        if active_capture is not None:
+            active_capture.discard()
         cap.release()
         sink.close()
         print("RTSP stream processing complete.")

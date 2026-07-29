@@ -64,6 +64,30 @@ When a coil motion segment is detected (lasting at least 10 seconds), a timestam
 
 Multiple segments will result in multiple such folders.
 
+Each saved segment also acts as a capture for manual labeling. By default, the capture stores the last 30 segment frames; adjust `SEGMENT_FRAME_BUFFER_SIZE` in `FFT_RTSP.py` if you need more or fewer frames per capture.
+
+```
+2025_Jul_13-14-00-12_to_14-00-22/
+├── manifest.json                              # Capture metadata and frame index
+├── frames/                                    # Raw frames from the FFT segment
+│   ├── frame_000000.jpg
+│   └── frame_000001.jpg
+└── labels/
+    └── true_ellipse.json                     # Manual source-of-truth ellipse label
+```
+
+Start the capture labeler with:
+
+```bash
+python label_capture_web.py
+```
+
+Then open:
+
+```
+http://localhost:8050
+```
+
 ---
 
 ## ⚙️ Threshold Settings
