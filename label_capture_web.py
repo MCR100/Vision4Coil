@@ -11,6 +11,8 @@ from coil_cv import select_final_loop_model
 from ellipse_scoring import score_capture_labels
 
 
+# Application configuration
+
 app = Flask(__name__)
 CAPTURE_ROOT = Path("output").resolve()
 LABEL_REL_PATH = Path("labels") / "true_ellipse.json"
@@ -47,6 +49,8 @@ SCORE_LOG_COLUMNS = [
     "shape_canvas_height",
 ]
 
+
+# Embedded browser client
 
 HTML = r"""
 <!doctype html>
@@ -304,6 +308,8 @@ HTML = r"""
 </div>
 
 <script>
+// State and DOM helpers
+
 const $ = (id) => document.getElementById(id);
 const state = {
   captures: [],
@@ -446,6 +452,15 @@ function cloneEllipse(e) {
   return e ? {cx: e.cx, cy: e.cy, rx: e.rx, ry: e.ry, rotation_deg: e.rotation_deg} : null;
 }
 
+function clonePerspective(perspective) {
+  if (!perspective) return null;
+  return {
+    mode: perspective.mode,
+    base_ellipse: cloneEllipse(perspective.base_ellipse),
+    corners: perspective.corners.map(({x, y}) => ({x, y})),
+  };
+}
+
 function normalizePoint(raw) {
   return {x: Number(raw.x || 0), y: Number(raw.y || 0)};
 }
@@ -464,6 +479,12 @@ function normalizePerspective(raw) {
 function updateModeButtons() {
   const p = $('perspectiveBtn');
   if (p) p.classList.toggle('primary', state.editMode === 'perspective');
+}
+
+function renderEditor() {
+  syncFields();
+  updateModeButtons();
+  drawOverlay();
 }
 
 function ellipseSourceCorners(e) {
@@ -501,8 +522,7 @@ function togglePerspectiveMode() {
     state.editMode = 'perspective';
   }
   state.mode = 'select';
-  updateModeButtons();
-  drawOverlay();
+  renderEditor();
 }
 
 function solveLinearSystem(matrix, rhs) {
@@ -624,13 +644,11 @@ function usePrediction() {
   state.ellipse = normalizeEllipse(state.capture.prediction.ellipse);
   state.perspective = null;
   state.editMode = 'ellipse';
-  updateModeButtons();
   state.scorePrediction = null;
   if (Number.isInteger(state.capture.prediction.frame_index)) {
     setFrame(state.capture.prediction.frame_index);
   }
-  syncFields();
-  drawOverlay();
+  renderEditor();
   setStatus('Prediction copied into the editable truth ellipse.');
 }
 
@@ -638,10 +656,8 @@ function clearEllipse() {
   state.ellipse = null;
   state.perspective = null;
   state.editMode = 'ellipse';
-  updateModeButtons();
   state.scorePrediction = null;
-  syncFields();
-  drawOverlay();
+  renderEditor();
 }
 
 function syncFields() {
@@ -864,7 +880,7 @@ function canvasDown(event) {
     }
     state.action = hit.type;
     state.perspectiveCornerIndex = hit.index;
-    state.actionStart = JSON.parse(JSON.stringify(state.perspective));
+    state.actionStart = clonePerspective(state.perspective);
     drawOverlay();
     return;
   }
@@ -931,8 +947,7 @@ function canvasUp(event) {
   state.perspectiveCornerIndex = null;
   state.mode = 'select';
   $('drawBtn').classList.remove('primary');
-  syncFields();
-  drawOverlay();
+  renderEditor();
 }
 
 function nudge(dx, dy) {
@@ -1050,8 +1065,8 @@ $('overlay').addEventListener('pointercancel', canvasUp);
 $('drawBtn').addEventListener('click', () => {
   state.editMode = 'ellipse';
   state.perspective = null;
-  updateModeButtons();
   state.mode = 'draw';
+  updateModeButtons();
   $('drawBtn').classList.add('primary');
 });
 $('perspectiveBtn').addEventListener('click', togglePerspectiveMode);
@@ -1082,6 +1097,8 @@ loadCaptures().catch((error) => setStatus(error.message));
 """
 
 
+# Capture repository helpers
+
 def capture_path(capture_id):
     path = (CAPTURE_ROOT / capture_id).resolve()
     if CAPTURE_ROOT not in path.parents and path != CAPTURE_ROOT:
@@ -1095,6 +1112,14 @@ def load_json(path):
     if not path.exists():
         return None
     return json.loads(path.read_text())
+
+
+def require_capture(capture_id):
+    capture_dir = capture_path(capture_id)
+    manifest = load_manifest(capture_dir)
+    if manifest is None:
+        abort(404)
+    return capture_dir, manifest
 
 
 def frame_label_path(capture_dir, frame_index):
@@ -1154,6 +1179,8 @@ def load_manifest(capture_dir):
         return None
     return manifest
 
+
+# Prediction and scoring helpers
 
 def detection_info(capture_dir):
     json_files = sorted(capture_dir.glob("tail_detected_*.json"))
@@ -1332,6 +1359,8 @@ def all_captures():
     return captures
 
 
+# Label validation and serialization
+
 def clean_float(value, default=0.0):
     try:
         return float(value)
@@ -1382,6 +1411,71 @@ def clean_perspective(raw):
     }
 
 
+def clean_int(value, default=0):
+    if value is None or value == "":
+        return default
+    try:
+        return int(value)
+    except (TypeError, ValueError) as error:
+        raise ValueError(f"Expected an integer, got {value!r}.") from error
+
+
+def build_label(capture_dir, manifest, payload):
+    frames = manifest.get("frames") or []
+    frame_index = clean_int(payload.get("frame_index"), 0)
+    if frame_index < 0 or frame_index >= len(frames):
+        raise ValueError("frame_index is outside this capture.")
+
+    editor_mode = payload.get("editor_mode")
+    if editor_mode not in {"ellipse", "perspective"}:
+        editor_mode = "ellipse"
+    perspective = clean_perspective(payload.get("perspective"))
+    if editor_mode == "perspective" and perspective is None:
+        raise ValueError("Perspective labels require four corners and a base ellipse.")
+
+    now = datetime.now(timezone.utc).isoformat()
+    existing = load_json(capture_dir / LABEL_REL_PATH) or {}
+    frame_record = frames[frame_index]
+    label = {
+        "schema_version": 1,
+        "label_type": "true_loop_ellipse",
+        "capture_id": capture_dir.name,
+        "created_utc": existing.get("created_utc") or now,
+        "updated_utc": now,
+        "frame": {
+            "index": frame_index,
+            "path": payload.get("frame_path") or frame_record.get("path"),
+            "t_s": payload.get("frame_t_s", frame_record.get("t_s")),
+            "fft_intensity": payload.get("frame_fft_intensity", frame_record.get("fft_intensity")),
+            "image_width": clean_int(payload.get("image_width"), 0),
+            "image_height": clean_int(payload.get("image_height"), 0),
+        },
+        "ellipse": label_ellipse(payload.get("ellipse") or {}),
+        "editor_mode": editor_mode,
+        "notes": payload.get("notes") or "",
+    }
+    if perspective is not None:
+        label["perspective"] = perspective
+    return label
+
+
+def write_json(path, payload):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path = path.with_suffix(path.suffix + ".tmp")
+    temporary_path.write_text(json.dumps(payload, indent=2))
+    temporary_path.replace(path)
+
+
+def save_label_files(capture_dir, label):
+    label_path = capture_dir / LABEL_REL_PATH
+    per_frame_path = frame_label_path(capture_dir, label["frame"]["index"])
+    write_json(label_path, label)
+    write_json(per_frame_path, label)
+    return label_path, per_frame_path
+
+
+# Flask routes
+
 @app.get("/")
 def index():
     return render_template_string(HTML)
@@ -1394,10 +1488,7 @@ def api_captures():
 
 @app.get("/api/captures/<capture_id>")
 def api_capture(capture_id):
-    capture_dir = capture_path(capture_id)
-    manifest = load_manifest(capture_dir)
-    if manifest is None:
-        abort(404)
+    capture_dir, manifest = require_capture(capture_id)
     payload = dict(manifest)
     payload["id"] = capture_dir.name
     payload["label"] = load_json(capture_dir / LABEL_REL_PATH)
@@ -1426,62 +1517,24 @@ def api_get_label(capture_id):
 
 @app.post("/api/captures/<capture_id>/label")
 def api_save_label(capture_id):
-    capture_dir = capture_path(capture_id)
-    manifest = load_manifest(capture_dir)
-    if manifest is None:
-        abort(404)
+    capture_dir, manifest = require_capture(capture_id)
+    try:
+        label = build_label(capture_dir, manifest, request.get_json(force=True) or {})
+    except ValueError as error:
+        return jsonify({"error": str(error)}), 400
 
-    payload = request.get_json(force=True) or {}
-    ellipse_raw = payload.get("ellipse") or {}
-    frame_index = int(payload.get("frame_index") or 0)
-    frames = manifest.get("frames") or []
-    if frame_index < 0 or frame_index >= len(frames):
-        return jsonify({"error": "frame_index is outside this capture."}), 400
-
-    now = datetime.now(timezone.utc).isoformat()
-    existing = load_json(capture_dir / LABEL_REL_PATH) or {}
-    ellipse = label_ellipse(ellipse_raw)
-    editor_mode = payload.get("editor_mode") if payload.get("editor_mode") in {"ellipse", "perspective"} else "ellipse"
-    perspective = clean_perspective(payload.get("perspective"))
-    if editor_mode == "perspective" and perspective is None:
-        return jsonify({"error": "Perspective labels require four corners and a base ellipse."}), 400
-    frame_record = frames[frame_index]
-    label = {
-        "schema_version": 1,
-        "label_type": "true_loop_ellipse",
-        "capture_id": capture_dir.name,
-        "created_utc": existing.get("created_utc") or now,
-        "updated_utc": now,
-        "frame": {
-            "index": frame_index,
-            "path": payload.get("frame_path") or frame_record.get("path"),
-            "t_s": payload.get("frame_t_s", frame_record.get("t_s")),
-            "fft_intensity": payload.get("frame_fft_intensity", frame_record.get("fft_intensity")),
-            "image_width": int(payload.get("image_width") or 0),
-            "image_height": int(payload.get("image_height") or 0),
-        },
-        "ellipse": ellipse,
-        "editor_mode": editor_mode,
-        "notes": payload.get("notes") or "",
-    }
-    if perspective is not None:
-        label["perspective"] = perspective
-
-    label_path = capture_dir / LABEL_REL_PATH
-    per_frame_label_path = frame_label_path(capture_dir, frame_index)
-    label_path.parent.mkdir(parents=True, exist_ok=True)
-    label_json = json.dumps(label, indent=2)
-    label_path.write_text(label_json)
-    per_frame_label_path.write_text(label_json)
-    return jsonify({"ok": True, "path": str(label_path), "frame_path": str(per_frame_label_path), "label": label})
+    label_path, per_frame_path = save_label_files(capture_dir, label)
+    return jsonify({
+        "ok": True,
+        "path": str(label_path),
+        "frame_path": str(per_frame_path),
+        "label": label,
+    })
 
 
 @app.post("/api/captures/<capture_id>/score")
 def api_score_capture(capture_id):
-    capture_dir = capture_path(capture_id)
-    manifest = load_manifest(capture_dir)
-    if manifest is None:
-        abort(404)
+    capture_dir, _ = require_capture(capture_id)
 
     labels = load_truth_labels(capture_dir)
     prediction = recompute_detection_info(capture_dir)
