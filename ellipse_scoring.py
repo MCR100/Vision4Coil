@@ -134,23 +134,7 @@ def score_ellipses(truth_ellipse, prediction_ellipse, image_width, image_height)
     pred_boundary = ellipse_mask(image_shape, pred, filled=False)
     boundary_iou = mask_iou(truth_boundary, pred_boundary)
 
-    base_weights = {
-        "boundary_iou": 0.0,
-        "filled_iou": 1.0,
-        "center_score": 0.0,
-        "axis_score": 0.0,
-        "angle_score": 0.0,
-    }
-    active_weight_sum = sum(base_weights.values())
-    weighted = (
-        base_weights["boundary_iou"] * boundary_iou
-        + base_weights["filled_iou"] * filled_iou
-        + base_weights["center_score"] * components["center_score"]
-        + base_weights["axis_score"] * components["axis_score"]
-        + base_weights["angle_score"] * components["angle_score"]
-    ) / active_weight_sum
-
-    return _rounded_metrics(weighted, components, boundary_iou, filled_iou)
+    return _rounded_metrics(filled_iou, components, boundary_iou, filled_iou)
 
 
 def shape_canvas_shape(truth, pred):
@@ -178,22 +162,8 @@ def score_ellipse_shape(truth_ellipse, prediction_ellipse):
     pred_boundary = ellipse_mask(image_shape, pred, filled=False)
     boundary_iou = mask_iou(truth_boundary, pred_boundary)
 
-    base_weights = {
-        "boundary_iou": 0.0,
-        "filled_iou": 1.0,
-        "axis_score": 0.0,
-        "angle_score": 0.0,
-    }
-    active_weight_sum = sum(base_weights.values())
-    weighted = (
-        base_weights["boundary_iou"] * boundary_iou
-        + base_weights["filled_iou"] * filled_iou
-        + base_weights["axis_score"] * components["axis_score"]
-        + base_weights["angle_score"] * components["angle_score"]
-    ) / active_weight_sum
-
     return _rounded_metrics(
-        weighted,
+        filled_iou,
         components,
         boundary_iou,
         filled_iou,
@@ -280,7 +250,3 @@ def score_capture_labels(label_payload, prediction):
         "truth_ellipse": label.get("ellipse"),
         "metrics": metrics,
     }
-
-
-def score_same_frame_label(label, prediction):
-    return score_capture_labels(label, prediction)

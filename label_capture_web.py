@@ -8,7 +8,7 @@ import cv2
 import numpy as np
 from flask import Flask, abort, jsonify, render_template_string, request, send_file
 
-from coil_cv import select_final_loop_model, select_loop_accumulation_frames
+from coil_cv import select_final_loop_model, select_loop_accumulation_indices
 from ellipse_scoring import score_capture_labels
 
 
@@ -1392,21 +1392,31 @@ def recompute_detection_info(capture_dir):
     if frame_record is None:
         return None
 
+    capture_dir_resolved = capture_dir.resolve()
     frame_path = (capture_dir / frame_record.get("path", "")).resolve()
-    if capture_dir.resolve() not in frame_path.parents or not frame_path.is_file():
+    if capture_dir_resolved not in frame_path.parents or not frame_path.is_file():
         return None
     frame = cv2.imread(str(frame_path))
     if frame is None:
         return None
 
-    capture_frames = []
-    for record in frames:
-        saved_path = (capture_dir / record.get("path", "")).resolve()
-        saved_frame = cv2.imread(str(saved_path)) if saved_path.is_file() else None
-        if saved_frame is None:
-            return None
-        capture_frames.append(saved_frame)
-    accumulation_frames = select_loop_accumulation_frames(capture_frames, frame_index)
+    accumulation_indices = select_loop_accumulation_indices(len(frames), frame_index)
+
+    def load_accumulation_frames():
+        loaded_frames = []
+        for position in accumulation_indices:
+            record = frames[position]
+            if record is frame_record:
+                saved_frame = frame
+            else:
+                saved_path = (capture_dir / record.get("path", "")).resolve()
+                if capture_dir_resolved not in saved_path.parents or not saved_path.is_file():
+                    return None
+                saved_frame = cv2.imread(str(saved_path))
+                if saved_frame is None:
+                    return None
+            loaded_frames.append((position, saved_frame))
+        return loaded_frames
 
     segment_xy = data.get("segment_xy")
     tail_tip = data.get("tail_tip")
@@ -1419,7 +1429,7 @@ def recompute_detection_info(capture_dir):
         tail_tip=tail_tip,
         tail_base=data.get("tail_base"),
         bbox=data.get("bbox"),
-        accumulation_frames=accumulation_frames,
+        accumulation_frames=load_accumulation_frames,
     )
     if ellipse_info is None:
         return {

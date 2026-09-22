@@ -3,7 +3,9 @@ import numpy as np
 import os
 import json
 import shutil
-from datetime import timedelta, datetime
+from datetime import datetime
+from functools import lru_cache
+
 import plotly.graph_objects as go
 import matplotlib.pyplot as plt
 from pathlib import Path
@@ -36,7 +38,6 @@ from coil_cv import (
 
 # ----- CONFIG -----
 THRESHOLD = 4264.8  # 4264.8 for DB16 ; 3200 for R5.5 ; 3900 for R8.5
-TARGET_SIZE = (480, 270)
 
 USERNAME = "admin"
 PASSWORD = "passkey"
@@ -77,8 +78,9 @@ class CvGuiSink(BaseSink):
         self.show_plot = show_plot
         self._stop = False
 
-        self._graph_time = []
-        self._graph_intensity = []
+        self._graph_time = deque(maxlen=3000)
+        self._graph_intensity = deque(maxlen=3000)
+        self._graph_update_count = 0
 
         if self.show_plot:
             plt.ion()
@@ -101,10 +103,11 @@ class CvGuiSink(BaseSink):
 
         self._graph_time.append(t_s)
         self._graph_intensity.append(intensity)
+        self._graph_update_count += 1
 
-        if len(self._graph_time) % 5 == 0 and self._graph_time:
-            self.line.set_xdata(self._graph_time)
-            self.line.set_ydata(self._graph_intensity)
+        if self._graph_update_count % 5 == 0 and self._graph_time:
+            self.line.set_xdata(list(self._graph_time))
+            self.line.set_ydata(list(self._graph_intensity))
             self.ax.set_xlim(min(self._graph_time), max(self._graph_time) + 5)
             self.ax.set_ylim(min(self._graph_intensity) - 50, max(self._graph_intensity) + 50)
             self.ax.figure.canvas.draw()
@@ -134,14 +137,30 @@ class NullSink(BaseSink):
 # -------------------------
 # FFT / logging helpers
 # -------------------------
+@lru_cache(maxsize=8)
+def fft_roi_geometry(frame_height, frame_width, roi_points):
+    """Build the cropped ROI mask once for a frame geometry and point set."""
+    roi_contour = np.asarray(roi_points, dtype=np.int32)
+    x, y, width, height = cv2.boundingRect(roi_contour)
+    x1 = max(0, x)
+    y1 = max(0, y)
+    x2 = min(int(frame_width), x + width)
+    y2 = min(int(frame_height), y + height)
+    if x2 <= x1 or y2 <= y1:
+        raise ValueError("ROI does not overlap the frame.")
+
+    local_contour = roi_contour - np.array([x1, y1], dtype=np.int32)
+    mask = np.zeros((y2 - y1, x2 - x1), dtype=np.uint8)
+    cv2.fillPoly(mask, [local_contour], 255)
+    return (x1, y1, x2, y2), mask
+
+
 def compute_fft_spectrum(frame, roi_points):
-    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    mask = np.zeros_like(gray, dtype=np.uint8)
-    roi_contour = np.array(roi_points, dtype=np.int32)
-    cv2.fillPoly(mask, [roi_contour], 255)
-    roi = cv2.bitwise_and(gray, gray, mask=mask)
-    x, y, w, h = cv2.boundingRect(roi_contour)
-    roi_cropped = roi[y:y + h, x:x + w]
+    frame_height, frame_width = frame.shape[:2]
+    points_key = tuple((int(x), int(y)) for x, y in roi_points)
+    (x1, y1, x2, y2), mask = fft_roi_geometry(frame_height, frame_width, points_key)
+    gray = cv2.cvtColor(frame[y1:y2, x1:x2], cv2.COLOR_BGR2GRAY)
+    roi_cropped = cv2.bitwise_and(gray, gray, mask=mask)
 
     roi_float = np.float32(roi_cropped)
     dft = cv2.dft(roi_float, flags=cv2.DFT_COMPLEX_OUTPUT)
@@ -149,10 +168,6 @@ def compute_fft_spectrum(frame, roi_points):
     magnitude = cv2.magnitude(dft_shift[:, :, 0], dft_shift[:, :, 1])
 
     return np.mean(magnitude), roi_cropped
-
-
-def format_time(seconds):
-    return str(timedelta(seconds=int(seconds))).replace(":", "-")
 
 
 def create_timestamped_folder(start_dt, end_dt):
@@ -336,11 +351,8 @@ def detect_tail_and_save(frames, roi_points, save_path, conf_thresh=0.6):
         signed_offset_x_px = float(tail_cx - body_x)
         abs_offset_x_px = float(abs(signed_offset_x_px))
 
-
     if loop_roi_box is not None:
         draw_loop_search_roi(annotated, loop_roi_box)
-
-    if loop_roi_box is not None:
         annotation_x = int(loop_roi_box[0]) + 18
         annotation_y = int(loop_roi_box[1]) + 30
     else:

@@ -5,12 +5,13 @@ and optional diagnostic image generation. FFT_RTSP.py keeps the stream/FFT
 orchestration and result persistence.
 """
 
+from functools import lru_cache
+
 import cv2
 import json
 import math
 import numpy as np
 from pathlib import Path
-from ultralytics import YOLO
 
 # Multi-frame loop accumulation
 DEBUG_SAVE_TOP_K_DIRECT = 5
@@ -21,8 +22,12 @@ LOOP_ACCUMULATION_STRIDE = 1
 LOOP_ACCUMULATION_MIN_VOTES = 3
 LOOP_ACCUMULATION_HISTORY_BIAS = 0.75
 
-# Segmentation-capable YOLO model
-model = YOLO("YOLO11/weights/best.pt")
+@lru_cache(maxsize=1)
+def get_segmentation_model():
+    """Load the segmentation model only when tail detection is requested."""
+    from ultralytics import YOLO
+
+    return YOLO("YOLO11/weights/best.pt")
 
 # Hardcoded body reference polyline
 BODY_POLYLINE_POINTS = [
@@ -41,7 +46,6 @@ ELLIPSE_SEARCH_PAD_Y_UP = 180
 ELLIPSE_SEARCH_PAD_Y_DOWN = 380
 MIN_CONTOUR_POINTS_FOR_ELLIPSE = 30
 TAIL_BOX_EXCLUDE_PAD = 12
-TAIL_EXCLUSION_WIDTH = 20
 SEGMENT_BOUNDARY_THICKNESS = 3
 ELLIPSE_OVERLAP_THICKNESS = 3
 COIL_RED_MIN = 0
@@ -395,12 +399,13 @@ def extract_best_tail_segment(frames, conf_thresh=0.6):
     best = None
     best_conf = -1.0
 
+    segmentation_model = get_segmentation_model()
     start_idx = max(0, len(frames) - LOOP_FIT_FRAME_WINDOW)
 
     for frame_idx in range(len(frames) - 1, start_idx - 1, -1):
         frame = frames[frame_idx]
 
-        result = model.predict(
+        result = segmentation_model.predict(
             frame,
             conf=conf_thresh,
             verbose=False,
@@ -441,17 +446,17 @@ def extract_best_tail_segment(frames, conf_thresh=0.6):
     return best
 
 
-def select_loop_accumulation_frames(frames, best_frame_index, max_frames=LOOP_ACCUMULATION_MAX_FRAMES, stride=LOOP_ACCUMULATION_STRIDE):
-    if not frames:
+def select_loop_accumulation_indices(frame_count, best_frame_index, max_frames=LOOP_ACCUMULATION_MAX_FRAMES, stride=LOOP_ACCUMULATION_STRIDE):
+    if int(frame_count) <= 0:
         return []
 
-    n = len(frames)
+    n = int(frame_count)
     best_frame_index = max(0, min(int(best_frame_index), n - 1))
     stride = max(1, int(stride))
     max_frames = max(1, int(max_frames))
 
     if max_frames == 1:
-        return [(best_frame_index, frames[best_frame_index])]
+        return [best_frame_index]
 
     usable_slots = max_frames - 1
     preferred_history = int(math.ceil(usable_slots * LOOP_ACCUMULATION_HISTORY_BIAS))
@@ -481,7 +486,13 @@ def select_loop_accumulation_frames(frames, best_frame_index, max_frames=LOOP_AC
             selected_indices.append(idx)
             remaining_slots -= 1
 
-    selected_indices = sorted(set(selected_indices))
+    return sorted(set(selected_indices))
+
+
+def select_loop_accumulation_frames(frames, best_frame_index, max_frames=LOOP_ACCUMULATION_MAX_FRAMES, stride=LOOP_ACCUMULATION_STRIDE):
+    selected_indices = select_loop_accumulation_indices(
+        len(frames), best_frame_index, max_frames=max_frames, stride=stride
+    )
     return [(idx, frames[idx]) for idx in selected_indices]
 
 
@@ -1136,50 +1147,80 @@ def thermal_loop_search_geometry(tail_upper_span):
     }
 
 
-def ellipse_sector_support(
-    centerline_bool,
-    valid_bool,
-    close_support,
-    local_ellipse,
+@lru_cache(maxsize=512)
+def ellipse_centerline_samples(
+    local_height,
+    local_width,
+    center_x,
+    center_y,
+    axis_a,
+    axis_b,
+    angle,
+    thickness=THERMAL_LOOP_CENTERLINE_THICKNESS,
     sector_count=THERMAL_LOOP_SECTOR_COUNT,
 ):
-    ys, xs = np.where(centerline_bool)
+    """Cache centerline coordinates and angular sectors for repeated ellipse shapes."""
+    local_shape = (int(local_height), int(local_width))
+    local_ellipse = (
+        (int(center_x), int(center_y)),
+        (axis_a, axis_b),
+        float(angle),
+    )
+    centerline = ellipse_params_outline_to_mask(
+        local_shape, local_ellipse, thickness=int(thickness)
+    )
+    ys, xs = np.where(centerline > 0)
     if len(xs) == 0:
-        return 0, [], []
+        return ys, xs, np.empty(0, dtype=np.int32)
 
-    (cx, cy), (a, b), angle = local_ellipse
     theta = math.radians(float(angle))
     cos_t = math.cos(theta)
     sin_t = math.sin(theta)
-    dx = xs.astype(np.float32) - float(cx)
-    dy = ys.astype(np.float32) - float(cy)
+    dx = xs.astype(np.float32) - float(center_x)
+    dy = ys.astype(np.float32) - float(center_y)
     local_x = cos_t * dx + sin_t * dy
     local_y = -sin_t * dx + cos_t * dy
     params = np.mod(
-        np.arctan2(local_y / max(1.0, float(b)), local_x / max(1.0, float(a))),
+        np.arctan2(
+            local_y / max(1.0, float(axis_b)),
+            local_x / max(1.0, float(axis_a)),
+        ),
         2.0 * math.pi,
     )
     sector_ids = np.minimum(
         int(sector_count) - 1,
         (params * float(sector_count) / (2.0 * math.pi)).astype(np.int32),
     )
+    return ys, xs, sector_ids
 
-    valid_values = valid_bool[ys, xs]
-    close_values = np.zeros(len(xs), dtype=bool)
+
+def ellipse_sector_support(
+    sector_ids,
+    valid_values,
+    close_support,
+    sector_count=THERMAL_LOOP_SECTOR_COUNT,
+):
+    close_values = np.zeros(len(sector_ids), dtype=bool)
     close_values[valid_values] = close_support
-    sector_ratios = []
-    sector_valid_pixels = []
-    supported = 0
-    for sector in range(int(sector_count)):
-        in_sector = sector_ids == sector
-        valid_count = int(np.count_nonzero(in_sector & valid_values))
-        close_count = int(np.count_nonzero(in_sector & close_values))
-        ratio = close_count / float(max(1, valid_count))
-        sector_valid_pixels.append(valid_count)
-        sector_ratios.append(float(ratio))
-        if valid_count >= 12 and ratio >= 0.35:
-            supported += 1
-    return int(supported), sector_ratios, sector_valid_pixels
+    sector_valid_pixels = np.bincount(
+        sector_ids[valid_values], minlength=int(sector_count)
+    )
+    sector_close_pixels = np.bincount(
+        sector_ids[close_values], minlength=int(sector_count)
+    )
+    sector_ratios = np.divide(
+        sector_close_pixels,
+        np.maximum(1, sector_valid_pixels),
+        dtype=np.float64,
+    )
+    supported = np.count_nonzero(
+        (sector_valid_pixels >= 12) & (sector_ratios >= 0.35)
+    )
+    return (
+        int(supported),
+        sector_ratios.astype(float).tolist(),
+        sector_valid_pixels.astype(int).tolist(),
+    )
 
 
 def ellipse_offset_contrast(local_shape, local_ellipse, valid_region, local_material, offset_px):
@@ -1214,6 +1255,7 @@ def score_thermal_last_loop_ellipse(
     score_sigma,
     polyline_points=BODY_POLYLINE_POINTS,
     guide_mask=None,
+    minimum_score=None,
 ):
     center, axes, angle = ellipse_params
     cx_i, cy_i = int(center[0]), int(center[1])
@@ -1228,13 +1270,16 @@ def score_thermal_last_loop_ellipse(
 
     local_shape = (y2 - y1, x2 - x1)
     local_ellipse = ((cx_i - x1, cy_i - y1), axes, angle)
-    centerline_mask = ellipse_params_outline_to_mask(
-        local_shape,
-        local_ellipse,
-        thickness=THERMAL_LOOP_CENTERLINE_THICKNESS,
+    centerline_ys, centerline_xs, sector_ids = ellipse_centerline_samples(
+        local_shape[0],
+        local_shape[1],
+        local_ellipse[0][0],
+        local_ellipse[0][1],
+        axes[0],
+        axes[1],
+        angle,
     )
-    centerline_bool = centerline_mask > 0
-    centerline_count = int(np.count_nonzero(centerline_bool))
+    centerline_count = len(centerline_xs)
     if centerline_count < THERMAL_LOOP_MIN_CENTERLINE_PIXELS:
         return None
 
@@ -1243,8 +1288,8 @@ def score_thermal_last_loop_ellipse(
     if np.count_nonzero(local_material) == 0:
         return None
 
-    valid_centerline = centerline_bool & ~local_exclusion
-    valid_centerline_count = int(np.count_nonzero(valid_centerline))
+    valid_centerline_values = ~local_exclusion[centerline_ys, centerline_xs]
+    valid_centerline_count = int(np.count_nonzero(valid_centerline_values))
     visible_ratio = valid_centerline_count / float(centerline_count)
     if (
         valid_centerline_count < THERMAL_LOOP_MIN_CENTERLINE_PIXELS
@@ -1252,8 +1297,10 @@ def score_thermal_last_loop_ellipse(
     ):
         return None
 
+    valid_centerline_ys = centerline_ys[valid_centerline_values]
+    valid_centerline_xs = centerline_xs[valid_centerline_values]
     local_distance = material_distance[y1:y2, x1:x2]
-    line_distances = local_distance[valid_centerline]
+    line_distances = local_distance[valid_centerline_ys, valid_centerline_xs]
     close_support = line_distances <= float(score_sigma)
     close_support_count = int(np.count_nonzero(close_support))
     close_support_ratio = close_support_count / float(valid_centerline_count)
@@ -1290,26 +1337,17 @@ def score_thermal_last_loop_ellipse(
         poly_score = max(0.0, 1.0 - (float(poly_dist) / 260.0))
 
     local_heat = heat[y1:y2, x1:x2]
-    supported_line_heat = float(np.mean(local_heat[valid_centerline][close_support]))
+    supported_line_heat = float(np.mean(
+        local_heat[
+            valid_centerline_ys[close_support],
+            valid_centerline_xs[close_support],
+        ]
+    ))
     valid_fill = fill_bool & ~local_exclusion
     valid_fill_count = max(1, int(np.count_nonzero(valid_fill)))
     fill_material = int(np.count_nonzero(valid_fill & local_material))
     fill_density = fill_material / float(valid_fill_count)
     exclusion_overlap = int(np.count_nonzero(output_ring_bool & local_exclusion)) / float(max(1, np.count_nonzero(output_ring_bool)))
-    supported_sectors, sector_support_ratios, sector_valid_pixels = ellipse_sector_support(
-        centerline_bool,
-        valid_centerline,
-        close_support,
-        local_ellipse,
-    )
-    sector_score = supported_sectors / float(THERMAL_LOOP_SECTOR_COUNT)
-    offset_contrast = ellipse_offset_contrast(
-        local_shape,
-        local_ellipse,
-        ~local_exclusion,
-        local_material,
-        offset_px=max(12.0, float(output_thickness)),
-    )
 
     guide_score = 0.0
     if guide_mask is not None:
@@ -1328,6 +1366,40 @@ def score_thermal_last_loop_ellipse(
     )
     angle_error_deg = angular_difference_deg(float(angle), THERMAL_LOOP_PREFERRED_ANGLE_DEG)
     angle_prior_score = math.exp(-0.5 * (angle_error_deg / THERMAL_LOOP_ANGLE_PRIOR_SIGMA_DEG) ** 2)
+
+    if minimum_score is not None:
+        score_upper_bound = (
+            3.4 * support_score +
+            1.8 * close_support_ratio +
+            1.5 * supported_line_heat +
+            0.8 * min(1.0, fill_density * 4.0) +
+            0.3 * poly_score +
+            0.5 * topness +
+            0.35 * aspect_score +
+            0.8 * axis_prior_score +
+            0.5 * angle_prior_score +
+            0.9 +
+            0.55 +
+            1.4 * guide_score -
+            0.04 * mean_distance +
+            1e-9
+        )
+        if score_upper_bound <= float(minimum_score):
+            return {"pruned_by_score_bound": True}
+
+    supported_sectors, sector_support_ratios, sector_valid_pixels = ellipse_sector_support(
+        sector_ids,
+        valid_centerline_values,
+        close_support,
+    )
+    sector_score = supported_sectors / float(THERMAL_LOOP_SECTOR_COUNT)
+    offset_contrast = ellipse_offset_contrast(
+        local_shape,
+        local_ellipse,
+        ~local_exclusion,
+        local_material,
+        offset_px=max(12.0, float(output_thickness)),
+    )
 
     score = (
         3.4 * support_score +
@@ -1407,9 +1479,15 @@ def refine_thermal_last_loop_ellipse(best, score_candidate):
             for ellipse in neighbors:
                 if ellipse[1][0] <= 1 or ellipse[1][1] <= 1:
                     continue
-                metrics = score_candidate(ellipse)
+                metrics = score_candidate(
+                    ellipse, best["metrics"]["score"] + 1e-6
+                )
                 refinement_candidates += 1
-                if metrics is not None and metrics["score"] > best["metrics"]["score"] + 1e-6:
+                if (
+                    metrics is not None
+                    and not metrics.get("pruned_by_score_bound", False)
+                    and metrics["score"] > best["metrics"]["score"] + 1e-6
+                ):
                     best = {"ellipse": ellipse, "metrics": metrics}
                     improved = True
                     break
@@ -1495,9 +1573,11 @@ def build_last_loop_mask_from_geometry(
     tail_x, tail_y = float(tail_tip[0]), float(tail_tip[1])
     best = None
     candidates_scored = 0
+    candidates_pruned_by_bound = 0
 
-    def score_candidate(ellipse):
-        return score_thermal_last_loop_ellipse(
+    def score_candidate(ellipse, minimum_score=None):
+        nonlocal candidates_pruned_by_bound
+        metrics = score_thermal_last_loop_ellipse(
             frame.shape,
             heat,
             material_mask,
@@ -1509,7 +1589,11 @@ def build_last_loop_mask_from_geometry(
             score_sigma=score_sigma,
             polyline_points=polyline_points,
             guide_mask=guide_mask,
+            minimum_score=minimum_score,
         )
+        if metrics is not None and metrics.get("pruned_by_score_bound", False):
+            candidates_pruned_by_bound += 1
+        return metrics
 
     for dy in range(center_y_start, THERMAL_LOOP_CENTER_Y_STOP + 1, THERMAL_LOOP_CENTER_Y_STEP):
         cy = int(round(tail_y + dy))
@@ -1535,11 +1619,14 @@ def build_last_loop_mask_from_geometry(
             for axes in axis_candidates:
                 for angle in angle_candidates:
                     ellipse = ((cx, cy), axes, float(angle))
-                    metrics = score_candidate(ellipse)
+                    minimum_score = None if best is None else best["metrics"]["score"]
+                    metrics = score_candidate(ellipse, minimum_score)
                     if metrics is None:
                         continue
 
                     candidates_scored += 1
+                    if metrics.get("pruned_by_score_bound", False):
+                        continue
                     if best is None or metrics["score"] > best["metrics"]["score"]:
                         best = {"ellipse": ellipse, "metrics": metrics}
 
@@ -1563,6 +1650,7 @@ def build_last_loop_mask_from_geometry(
         "best_ellipse_info": None,
         "best_metrics": None,
         "candidates_scored": int(candidates_scored),
+        "candidates_pruned_by_score_bound": int(candidates_pruned_by_bound),
         "dynamic_ring_thickness_px": int(output_thickness),
         "score_sigma_px": float(score_sigma),
         "angle_base_deg": float(base_angle),
@@ -3311,6 +3399,9 @@ def select_final_loop_model(frame, segment_xy, tail_tip, tail_base=None, bbox=No
             "chosen_method": THERMAL_LOOP_METHOD,
             "selection_reason": "thermal_polyline_selected",
         }
+
+    if callable(accumulation_frames):
+        accumulation_frames = accumulation_frames()
 
     direct_ellipse, direct_candidate_mask, direct_roi_box, direct_metrics, debug_masks = fit_final_loop_ellipse_from_segment(
         frame,
