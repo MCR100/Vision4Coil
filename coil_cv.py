@@ -170,6 +170,11 @@ THERMAL_LOOP_AXIS_A_VALUES = (240, 280, 320, 380)
 THERMAL_LOOP_AXIS_B_VALUES = (90, 115, 140, 170)
 THERMAL_LOOP_AXIS_Y_SCALE = 0.18
 THERMAL_LOOP_ANGLE_OFFSETS = (-12.0, -6.0, 0.0, 6.0, 12.0)
+THERMAL_LOOP_LONG_TAIL_ROI_MARGIN_PX = 60
+THERMAL_LOOP_UPPER_SPAN_BLEND_CENTER_PX = 135.0
+THERMAL_LOOP_UPPER_SPAN_BLEND_SCALE_PX = 10.0
+THERMAL_LOOP_ROI_SMOOTHNESS_PX = 12.0
+THERMAL_LOOP_UPPER_CENTER_Y_START = -80
 THERMAL_LOOP_MIN_CENTERLINE_PIXELS = 90
 THERMAL_LOOP_MIN_OBSERVED_PIXELS = 180
 THERMAL_LOOP_MIN_CLOSE_SUPPORT_RATIO = 0.18
@@ -956,14 +961,20 @@ def build_last_loop_heat_score(frame):
     return np.clip(heat, 0.0, 1.0).astype(np.float32)
 
 
-def build_last_loop_polyline_roi_mask(image_shape, tail_tip, polyline_points=BODY_POLYLINE_POINTS):
+def build_last_loop_polyline_roi_mask(
+    image_shape,
+    tail_tip,
+    polyline_points=BODY_POLYLINE_POINTS,
+    roi_up_from_tail=None,
+):
     h, w = image_shape[:2]
     mask = np.zeros((h, w), dtype=np.uint8)
     if tail_tip is None:
         return mask, None
 
     tail_x, tail_y = float(tail_tip[0]), float(tail_tip[1])
-    y1 = max(0, int(round(tail_y - THERMAL_LOOP_ROI_UP_FROM_TAIL)))
+    roi_up = THERMAL_LOOP_ROI_UP_FROM_TAIL if roi_up_from_tail is None else float(roi_up_from_tail)
+    y1 = max(0, int(round(tail_y - roi_up)))
     y2 = min(h, int(round(tail_y + THERMAL_LOOP_ROI_DOWN_FROM_TAIL)))
     if y2 <= y1:
         return mask, None
@@ -1080,14 +1091,20 @@ def estimate_material_width_px(material_mask, roi_box):
     return thickness, sigma
 
 
-def axis_candidates_for_y(center_y, tail_y):
+def axis_candidates_for_y(
+    center_y,
+    tail_y,
+    center_y_start=THERMAL_LOOP_CENTER_Y_START,
+    center_y_stop=THERMAL_LOOP_CENTER_Y_STOP,
+    axis_y_scale=THERMAL_LOOP_AXIS_Y_SCALE,
+):
     rel = np.clip(
-        (float(center_y) - (float(tail_y) + THERMAL_LOOP_CENTER_Y_START)) /
-        max(1.0, THERMAL_LOOP_CENTER_Y_STOP - THERMAL_LOOP_CENTER_Y_START),
+        (float(center_y) - (float(tail_y) + center_y_start)) /
+        max(1.0, center_y_stop - center_y_start),
         0.0,
         1.0,
     )
-    scale = 1.0 + THERMAL_LOOP_AXIS_Y_SCALE * (rel - 0.5)
+    scale = 1.0 + axis_y_scale * (rel - 0.5)
     candidates = []
     seen = set()
     for a in THERMAL_LOOP_AXIS_A_VALUES:
@@ -1097,6 +1114,26 @@ def axis_candidates_for_y(center_y, tail_y):
                 seen.add(axes)
                 candidates.append(axes)
     return candidates
+
+
+def thermal_loop_search_geometry(tail_upper_span):
+    """Continuously adapt the search envelope to the observed upper-tail extent."""
+    span = max(0.0, float(tail_upper_span))
+    blend_argument = (span - THERMAL_LOOP_UPPER_SPAN_BLEND_CENTER_PX) / THERMAL_LOOP_UPPER_SPAN_BLEND_SCALE_PX
+    adaptation_weight = 1.0 / (1.0 + math.exp(-blend_argument))
+
+    desired_roi_up = span + THERMAL_LOOP_LONG_TAIL_ROI_MARGIN_PX
+    smooth_argument = (desired_roi_up - THERMAL_LOOP_ROI_UP_FROM_TAIL) / THERMAL_LOOP_ROI_SMOOTHNESS_PX
+    softplus = smooth_argument if smooth_argument > 50.0 else math.log1p(math.exp(smooth_argument))
+    roi_up_from_tail = THERMAL_LOOP_ROI_UP_FROM_TAIL + THERMAL_LOOP_ROI_SMOOTHNESS_PX * softplus
+    center_y_start = int(round(THERMAL_LOOP_CENTER_Y_START + adaptation_weight * (THERMAL_LOOP_UPPER_CENTER_Y_START - THERMAL_LOOP_CENTER_Y_START)))
+    axis_y_scale = THERMAL_LOOP_AXIS_Y_SCALE * (1.0 - adaptation_weight)
+    return {
+        "adaptation_weight": float(adaptation_weight),
+        "roi_up_from_tail": float(roi_up_from_tail),
+        "center_y_start": int(center_y_start),
+        "axis_y_scale": float(axis_y_scale),
+    }
 
 
 def ellipse_sector_support(
@@ -1397,7 +1434,29 @@ def build_last_loop_mask_from_geometry(
     else:
         segment_mask = np.zeros(frame.shape[:2], dtype=np.uint8)
 
-    roi_mask, roi_box = build_last_loop_polyline_roi_mask(frame.shape, tail_tip, polyline_points)
+    tail_segment_aspect_ratio = 0.0
+    tail_upper_span = 0.0
+    if segment_xy is not None and len(segment_xy) > 0:
+        segment_xs = [float(point[0]) for point in segment_xy]
+        segment_ys = [float(point[1]) for point in segment_xy]
+        segment_width = max(segment_xs) - min(segment_xs)
+        segment_height = max(segment_ys) - min(segment_ys)
+        tail_segment_aspect_ratio = segment_width / max(1.0, segment_height)
+        tail_upper_span = max(
+            0.0,
+            float(tail_tip[1]) - min(float(point[1]) for point in segment_xy),
+        )
+    search_geometry = thermal_loop_search_geometry(tail_upper_span)
+    roi_up_from_tail = search_geometry["roi_up_from_tail"]
+    center_y_start = search_geometry["center_y_start"]
+    axis_y_scale = search_geometry["axis_y_scale"]
+
+    roi_mask, roi_box = build_last_loop_polyline_roi_mask(
+        frame.shape,
+        tail_tip,
+        polyline_points,
+        roi_up_from_tail=roi_up_from_tail,
+    )
     material_mask, heat, color_roi_mask = build_last_loop_material_mask(
         frame,
         roi_mask,
@@ -1452,7 +1511,7 @@ def build_last_loop_mask_from_geometry(
             guide_mask=guide_mask,
         )
 
-    for dy in range(THERMAL_LOOP_CENTER_Y_START, THERMAL_LOOP_CENTER_Y_STOP + 1, THERMAL_LOOP_CENTER_Y_STEP):
+    for dy in range(center_y_start, THERMAL_LOOP_CENTER_Y_STOP + 1, THERMAL_LOOP_CENTER_Y_STEP):
         cy = int(round(tail_y + dy))
         if cy < 0 or cy >= frame.shape[0]:
             continue
@@ -1461,7 +1520,13 @@ def build_last_loop_mask_from_geometry(
         if body_x is None:
             body_x = tail_x
 
-        axis_candidates = axis_candidates_for_y(cy, tail_y)
+        axis_candidates = axis_candidates_for_y(
+            cy,
+            tail_y,
+            center_y_start=center_y_start,
+            center_y_stop=THERMAL_LOOP_CENTER_Y_STOP,
+            axis_y_scale=axis_y_scale,
+        )
         for x_offset in THERMAL_LOOP_CENTER_X_OFFSETS:
             cx = int(round(body_x + x_offset))
             if cx < 0 or cx >= frame.shape[1]:
@@ -1503,6 +1568,12 @@ def build_last_loop_mask_from_geometry(
         "angle_base_deg": float(base_angle),
         "angle_source": angle_source,
         "angle_candidates_deg": [float(a) for a in angle_candidates],
+        "tail_upper_span_px": float(tail_upper_span),
+        "tail_segment_aspect_ratio": float(tail_segment_aspect_ratio),
+        "geometry_adaptation_weight": search_geometry["adaptation_weight"],
+        "roi_up_from_tail_px": float(roi_up_from_tail),
+        "center_y_start_from_tail_px": int(center_y_start),
+        "axis_y_scale": float(axis_y_scale),
     }
 
     if best is None:
@@ -2494,9 +2565,12 @@ def compute_ellipse_polyline_distance(
     # 3) Compute nearest Euclidean distance to the segment (for fallback / info)
     ys, xs = np.where(seg_mask > 0)
     euclid_dist = None
+    euclidean_segment_point = None
     if len(xs) > 0:
         dists = np.hypot(xs - ellipse_x, ys - ellipse_y)
-        euclid_dist = float(np.min(dists))
+        nearest_index = int(np.argmin(dists))
+        euclid_dist = float(dists[nearest_index])
+        euclidean_segment_point = (float(xs[nearest_index]), float(ys[nearest_index]))
 
     # 4) Estimate local polyline tangent (direction vector)
     pts = get_sorted_polyline(polyline_points)
@@ -2552,6 +2626,9 @@ def compute_ellipse_polyline_distance(
         "ellipse_point": (float(ellipse_x), float(ellipse_y)),
         "polyline_distance_px": float(best_poly_dist),
         "distance_along_polyline_px": distance_along,
+        "distance_value_px": euclid_dist,
+        "distance_method": "euclidean",
+        "euclidean_segment_point": euclidean_segment_point,
         "intersection_point": intersection,
         "euclidean_distance_px": euclid_dist,
     }
@@ -3326,7 +3403,7 @@ def point_to_ellipse_angle_deg(point, ellipse_info):
     return ellipse_parameter_angle_deg(point, ellipse_info)
 
 
-def draw_loop_ellipse(frame, ellipse_info, color=(255, 255, 0), thickness=2):
+def draw_loop_ellipse(frame, ellipse_info, color=(255, 255, 0), thickness=2, draw_center=True):
     cx, cy = ellipse_info["center"]
     a, b = ellipse_info["axes"]
     rot = ellipse_info["rotation_deg"]
@@ -3335,7 +3412,8 @@ def draw_loop_ellipse(frame, ellipse_info, color=(255, 255, 0), thickness=2):
     axes_i = (int(round(a)), int(round(b)))
 
     cv2.ellipse(frame, center_i, axes_i, rot, 0, 360, color, thickness)
-    cv2.circle(frame, center_i, 6, color, -1)
+    if draw_center:
+        cv2.circle(frame, center_i, 6, color, -1)
 
 
 def draw_loop_search_roi(frame, roi_box, color=(120, 120, 120), thickness=1):

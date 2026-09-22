@@ -82,6 +82,15 @@ Start the capture labeler with:
 python label_capture_web.py
 ```
 
+The labeler loads `planar_homography.npz` by default. Click **Measure distance**,
+press at the first point, drag, and release at the second point to display the
+calibrated distance in millimetres. Measurement mode and ellipse drawing are
+mutually exclusive. To use a different mapping:
+
+```bash
+python label_capture_web.py --homography path/to/planar_homography.npz
+```
+
 Then open:
 
 ```

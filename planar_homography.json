@@ -1,0 +1,71 @@
+{
+  "coordinate_contract": "image_to_world expects pixels from an image undistorted with the saved scaled_camera_matrix, dist_coeffs, and new_camera_matrix",
+  "units": "mm",
+  "source_name": "tail_detected_0.72.jpg",
+  "frame_size": [
+    2560,
+    1440
+  ],
+  "calibration_size": [
+    2048,
+    1149
+  ],
+  "rectangle_size_mm": [
+    326.0,
+    86.0
+  ],
+  "image_points": [
+    [
+      528.2397664633887,
+      1158.5635238283105
+    ],
+    [
+      664.7632645833528,
+      1048.367063485306
+    ],
+    [
+      729.8829810919432,
+      1062.4049089174057
+    ],
+    [
+      596.8590692708608,
+      1176.3202762637566
+    ]
+  ],
+  "world_points": [
+    [
+      0.0,
+      0.0
+    ],
+    [
+      326.0,
+      0.0
+    ],
+    [
+      326.0,
+      86.0
+    ],
+    [
+      0.0,
+      86.0
+    ]
+  ],
+  "image_to_world": [
+    [
+      -6.924071919526046,
+      26.757308241813877,
+      -27342.470067385017
+    ],
+    [
+      -12.690041878994906,
+      -15.721827018395164,
+      24918.11906842547
+    ],
+    [
+      -0.0010243868762201134,
+      -0.011697596388193317,
+      1.0
+    ]
+  ],
+  "mean_corner_reprojection_error_px": 3.0132361887826545e-05
+}

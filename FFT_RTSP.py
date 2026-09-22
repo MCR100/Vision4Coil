@@ -336,18 +336,23 @@ def detect_tail_and_save(frames, roi_points, save_path, conf_thresh=0.6):
         signed_offset_x_px = float(tail_cx - body_x)
         abs_offset_x_px = float(abs(signed_offset_x_px))
 
-        body_pt = (int(round(body_x)), int(round(tail_cy)))
-        cv2.circle(annotated, body_pt, 6, (255, 0, 255), -1)
 
     if loop_roi_box is not None:
         draw_loop_search_roi(annotated, loop_roi_box)
 
+    if loop_roi_box is not None:
+        annotation_x = int(loop_roi_box[0]) + 18
+        annotation_y = int(loop_roi_box[1]) + 30
+    else:
+        annotation_x = tail_pt[0] + 18
+        annotation_y = max(30, tail_pt[1] - 70)
+
     if ellipse_info is not None:
-        draw_loop_ellipse(annotated, ellipse_info, color=(255, 255, 0), thickness=2)
+        draw_loop_ellipse(annotated, ellipse_info, color=(255, 255, 0), thickness=2, draw_center=False)
 
         cx, cy = ellipse_info["center"]
         center_pt = (int(round(cx)), int(round(cy)))
-        cv2.line(annotated, center_pt, tail_pt, (255, 255, 0), 2)
+        cv2.line(annotated, center_pt, tail_pt, (255, 0, 255), 2)
 
         tail_loop_angle_deg = point_to_ellipse_angle_deg((tail_cx, tail_cy), ellipse_info)
         if tail_loop_angle_deg is not None:
@@ -355,10 +360,10 @@ def detect_tail_and_save(frames, roi_points, save_path, conf_thresh=0.6):
             cv2.putText(
                 annotated,
                 angle_text,
-                (tail_pt[0] + 10, tail_pt[1] + 20),
+                (annotation_x, annotation_y + 36),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.7,
-                (255, 255, 0),
+                (255, 0, 255),
                 2,
             )
 
@@ -372,22 +377,17 @@ def detect_tail_and_save(frames, roi_points, save_path, conf_thresh=0.6):
 
         if dist_info is not None:
             ep = dist_info.get("ellipse_point")
-            inter = dist_info.get("intersection_point")
-            d_along = dist_info.get("distance_along_polyline_px")
+            nearest = dist_info.get("euclidean_segment_point")
             euclid = dist_info.get("euclidean_distance_px")
-            if ep is not None:
+            if ep is not None and nearest is not None and euclid is not None:
                 epx, epy = int(round(ep[0])), int(round(ep[1]))
-                cv2.circle(annotated, (epx, epy), 4, (0, 255, 255), -1)
-            if inter is not None:
-                ipx, ipy = int(round(inter[0])), int(round(inter[1]))
-                cv2.circle(annotated, (ipx, ipy), 4, (0, 200, 200), -1)
-                if ep is not None:
-                    cv2.line(annotated, (epx, epy), (ipx, ipy), (0, 255, 255), 2)
-            # annotate distance text next to tail
-            d_display = d_along if d_along is not None else euclid
-            if d_display is not None:
-                txt = f"d_px={d_display:.1f}"
-                cv2.putText(annotated, txt, (tail_pt[0] + 6, tail_pt[1] + 6), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+                npx, npy = int(round(nearest[0])), int(round(nearest[1]))
+                cv2.line(annotated, (epx, epy), (npx, npy), (0, 255, 255), 3)
+                txt = f"euclidean_distance_px={euclid:.1f}"
+                cv2.putText(
+                    annotated, txt, (annotation_x, annotation_y), cv2.FONT_HERSHEY_SIMPLEX,
+                    0.65, (0, 255, 255), 2,
+                )
         else:
             dist_info = None
 
@@ -482,6 +482,13 @@ def detect_tail_and_save(frames, roi_points, save_path, conf_thresh=0.6):
                 round(float(dist_info["ellipse_point"][0]), 2),
                 round(float(dist_info["ellipse_point"][1]), 2),
             ],
+            "euclidean_segment_point": None if dist_info.get("euclidean_segment_point") is None else [
+                round(float(dist_info["euclidean_segment_point"][0]), 2),
+                round(float(dist_info["euclidean_segment_point"][1]), 2),
+            ],
+            "distance_method": "euclidean",
+            "distance_value_px": None if dist_info.get("euclidean_distance_px") is None else round(float(dist_info["euclidean_distance_px"]), 2),
+
             "intersection_point": None if dist_info.get("intersection_point") is None else [
                 round(float(dist_info["intersection_point"][0]), 2),
                 round(float(dist_info["intersection_point"][1]), 2),

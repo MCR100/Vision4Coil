@@ -5,9 +5,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import cv2
+import numpy as np
 from flask import Flask, abort, jsonify, render_template_string, request, send_file
 
-from coil_cv import select_final_loop_model
+from coil_cv import select_final_loop_model, select_loop_accumulation_frames
 from ellipse_scoring import score_capture_labels
 
 
@@ -18,6 +19,7 @@ CAPTURE_ROOT = Path("output").resolve()
 LABEL_REL_PATH = Path("labels") / "true_ellipse.json"
 LABEL_FRAME_GLOB = "true_ellipse_frame_*.json"
 SCORE_LOG_PATH = Path(__file__).resolve().parent / "score_log.csv"
+HOMOGRAPHY_PATH = Path(__file__).resolve().parent / "planar_homography.npz"
 SCORE_LOG_COLUMNS = [
     "logged_utc",
     "capture_id",
@@ -74,8 +76,10 @@ HTML = r"""
       --blue: #67b7dc;
     }
     * { box-sizing: border-box; }
+    html, body { height: 100%; }
     body {
       margin: 0;
+      overflow: hidden;
       background: var(--bg);
       color: var(--text);
       font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
@@ -105,15 +109,26 @@ HTML = r"""
     .app {
       display: grid;
       grid-template-columns: 300px minmax(0, 1fr) 320px;
-      min-height: 100vh;
+      height: 100vh;
+      min-height: 0;
+      overflow: hidden;
     }
     .sidebar, .tools {
       background: var(--panel);
       border-right: 1px solid var(--line);
-      min-height: 100vh;
-      overflow: auto;
+      height: 100vh;
+      min-height: 0;
+      overflow: hidden;
     }
-    .tools { border-right: 0; border-left: 1px solid var(--line); }
+    .sidebar {
+      display: grid;
+      grid-template-rows: auto minmax(0, 1fr);
+    }
+    .tools {
+      border-right: 0;
+      border-left: 1px solid var(--line);
+      overflow-y: auto;
+    }
     .head {
       padding: 14px;
       border-bottom: 1px solid var(--line);
@@ -124,7 +139,16 @@ HTML = r"""
     }
     h1, h2, h3 { margin: 0; font-size: 15px; letter-spacing: 0; }
     .muted { color: var(--muted); font-size: 12px; }
-    .capture-list { padding: 8px; display: grid; gap: 7px; }
+    .capture-list {
+      min-height: 0;
+      padding: 8px;
+      display: grid;
+      align-content: start;
+      gap: 7px;
+      overflow-y: auto;
+      overscroll-behavior: contain;
+      scrollbar-gutter: stable;
+    }
     .capture-item {
       width: 100%;
       text-align: left;
@@ -140,7 +164,9 @@ HTML = r"""
       min-width: 0;
       display: grid;
       grid-template-rows: auto minmax(0, 1fr) auto;
-      min-height: 100vh;
+      height: 100vh;
+      min-height: 0;
+      overflow: hidden;
     }
     .toolbar {
       padding: 10px 12px;
@@ -158,6 +184,7 @@ HTML = r"""
       align-items: start;
       justify-items: center;
       background: #090a0c;
+      overscroll-behavior: contain;
     }
     .stage {
       position: relative;
@@ -187,6 +214,7 @@ HTML = r"""
       padding: 10px 12px;
       display: grid;
       gap: 9px;
+      min-width: 0;
     }
     .range-row {
       display: grid;
@@ -224,18 +252,34 @@ HTML = r"""
     .empty {
       display: grid;
       place-items: center;
-      min-height: 100vh;
+      min-height: 0;
+      height: 100%;
       color: var(--muted);
       text-align: center;
       padding: 24px;
     }
     @media (max-width: 1100px) {
-      .app { grid-template-columns: 240px minmax(0, 1fr); }
-      .tools { grid-column: 1 / span 2; min-height: auto; border-left: 0; border-top: 1px solid var(--line); }
+      body { overflow: auto; }
+      .app {
+        height: auto;
+        min-height: 100vh;
+        overflow: visible;
+        grid-template-columns: 240px minmax(0, 1fr);
+      }
+      .sidebar, .main { height: 100vh; }
+      .tools {
+        grid-column: 1 / span 2;
+        height: auto;
+        min-height: auto;
+        border-left: 0;
+        border-top: 1px solid var(--line);
+      }
     }
     @media (max-width: 760px) {
       .app { display: block; }
-      .sidebar, .tools { min-height: auto; }
+      .sidebar { height: 35vh; min-height: 220px; }
+      .main { height: auto; min-height: 0; overflow: visible; }
+      .tools { height: auto; min-height: auto; }
       .stage img { max-height: 58vh; }
     }
   </style>
@@ -257,6 +301,7 @@ HTML = r"""
       <div style="flex:1"></div>
       <button id="drawBtn">New Ellipse</button>
       <button id="perspectiveBtn">Perspective Mode</button>
+      <button id="measureBtn">Measure distance</button>
       <button id="predictionBtn">Use Prediction</button>
       <button id="scoreBtn">Score</button>
       <button id="clearBtn" class="warn">Clear</button>
@@ -325,6 +370,8 @@ const state = {
   dragStart: null,
   actionStart: null,
   perspectiveCornerIndex: null,
+  measureMode: false,
+  measurement: null,
   label: null,
 };
 
@@ -429,6 +476,7 @@ function renderThumbs() {
 function setFrame(index) {
   if (!state.capture) return;
   state.frameIndex = Math.min(Math.max(0, Number(index)), state.capture.frames.length - 1);
+  state.measurement = null;
   const frame = state.capture.frames[state.frameIndex];
   $('frameImage').src = frameUrl(state.capture.id, frame);
   $('frameRange').value = state.frameIndex;
@@ -479,6 +527,23 @@ function normalizePerspective(raw) {
 function updateModeButtons() {
   const p = $('perspectiveBtn');
   if (p) p.classList.toggle('primary', state.editMode === 'perspective');
+  $('measureBtn').classList.toggle('primary', state.measureMode);
+  $('drawBtn').classList.toggle('primary', !state.measureMode && state.mode === 'draw');
+}
+
+function setMeasureMode(enabled) {
+  state.measureMode = Boolean(enabled);
+  state.action = null;
+  state.pointerId = null;
+  state.mode = 'select';
+  state.measurement = null;
+  if (state.measureMode) {
+    state.editMode = 'ellipse';
+    setStatus('Measure mode: press at the first point, drag, and release at the second point.');
+  } else {
+    setStatus('Measure mode off.');
+  }
+  renderEditor();
 }
 
 function renderEditor() {
@@ -509,6 +574,8 @@ function invalidatePerspectiveFromEllipseEdit() {
 }
 
 function togglePerspectiveMode() {
+  state.measureMode = false;
+  state.measurement = null;
   if (state.editMode === 'perspective') {
     state.editMode = 'ellipse';
   } else {
@@ -791,6 +858,50 @@ function drawPerspectiveOverlay(ctx) {
   });
 }
 
+function drawMeasurementOverlay(ctx) {
+  const m = state.measurement;
+  if (!m || !m.start || !m.end) return;
+  const canvas = $('overlay');
+  const scale = imageScale();
+  const lineWidth = Math.max(3, canvas.width / 650);
+  const radius = 1 * scale;
+  ctx.save();
+  ctx.strokeStyle = '#55d692';
+  ctx.fillStyle = '#55d692';
+  ctx.lineWidth = lineWidth;
+  ctx.setLineDash([]);
+  ctx.beginPath();
+  ctx.moveTo(m.start.x, m.start.y);
+  ctx.lineTo(m.end.x, m.end.y);
+  ctx.stroke();
+  [m.start, m.end].forEach((point) => {
+    ctx.beginPath();
+    ctx.arc(point.x, point.y, radius, 0, Math.PI * 2);
+    ctx.fill();
+  });
+  if (Number.isFinite(m.distanceMm)) {
+    const x = (m.start.x + m.end.x) / 2;
+    const y = (m.start.y + m.end.y) / 2;
+    const fontSize = Math.max(18, canvas.width / 75);
+    const label = `${m.distanceMm.toFixed(2)} mm`;
+    ctx.font = `bold ${fontSize}px ui-sans-serif, system-ui, sans-serif`;
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'bottom';
+    const metrics = ctx.measureText(label);
+    const pad = 7 * scale;
+    ctx.fillStyle = 'rgba(9, 10, 12, 0.82)';
+    ctx.fillRect(
+      x - metrics.width / 2 - pad,
+      y - fontSize - pad * 2,
+      metrics.width + pad * 2,
+      fontSize + pad * 2,
+    );
+    ctx.fillStyle = '#55d692';
+    ctx.fillText(label, x, y - pad);
+  }
+  ctx.restore();
+}
+
 function drawOverlay() {
   const canvas = $('overlay');
   const ctx = canvas.getContext('2d');
@@ -803,10 +914,14 @@ function drawOverlay() {
   if (state.editMode === 'perspective') {
     if (!state.perspective && state.ellipse) initPerspectiveFromEllipse();
     drawPerspectiveOverlay(ctx);
+    drawMeasurementOverlay(ctx);
     return;
   }
 
-  if (!state.ellipse) return;
+  if (!state.ellipse) {
+    drawMeasurementOverlay(ctx);
+    return;
+  }
   const e = state.ellipse;
   drawEllipseStroke(ctx, e, '#f5b642', [12, 8], Math.max(2, canvas.width / 800));
 
@@ -833,6 +948,7 @@ function drawOverlay() {
     ctx.fill();
     ctx.stroke();
   });
+  drawMeasurementOverlay(ctx);
 }
 
 function hitTest(point) {
@@ -867,6 +983,13 @@ function canvasDown(event) {
   const point = pointerPoint(event);
   state.pointerId = event.pointerId;
   state.dragStart = point;
+
+  if (state.measureMode) {
+    state.action = 'measure';
+    state.measurement = {start: point, end: point, distanceMm: null};
+    drawOverlay();
+    return;
+  }
 
   if (state.editMode === 'perspective') {
     if (!state.perspective) initPerspectiveFromEllipse();
@@ -907,6 +1030,12 @@ function canvasMove(event) {
   const point = pointerPoint(event);
   const start = state.actionStart;
   const drag = state.dragStart;
+  if (state.action === 'measure') {
+    state.measurement.end = point;
+    state.measurement.distanceMm = null;
+    drawOverlay();
+    return;
+  }
   if (state.action === 'perspective-corner') {
     if (!state.perspective || state.perspectiveCornerIndex === null) return;
     state.perspective.corners[state.perspectiveCornerIndex] = {x: point.x, y: point.y};
@@ -940,8 +1069,36 @@ function canvasMove(event) {
   drawOverlay();
 }
 
-function canvasUp(event) {
+async function canvasUp(event) {
   if (state.pointerId !== event.pointerId) return;
+  if (state.action === 'measure' && state.measurement) {
+    state.measurement.end = pointerPoint(event);
+    const measurement = state.measurement;
+    state.pointerId = null;
+    state.action = null;
+    drawOverlay();
+    try {
+      const payload = await fetchJson('/api/measure-distance', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({
+          points: [measurement.start, measurement.end],
+          frame_size: [$('frameImage').naturalWidth, $('frameImage').naturalHeight],
+        }),
+      });
+      if (state.measurement === measurement) {
+        measurement.distanceMm = payload.distance_mm;
+        measurement.worldPoints = payload.world_points;
+        setStatus(`Measured distance: ${payload.distance_mm.toFixed(2)} mm`);
+        drawOverlay();
+      }
+    } catch (error) {
+      if (state.measurement === measurement) {
+        setStatus(`Measurement failed: ${error.message}`);
+      }
+    }
+    return;
+  }
   state.pointerId = null;
   state.action = null;
   state.perspectiveCornerIndex = null;
@@ -1063,6 +1220,8 @@ $('overlay').addEventListener('pointermove', canvasMove);
 $('overlay').addEventListener('pointerup', canvasUp);
 $('overlay').addEventListener('pointercancel', canvasUp);
 $('drawBtn').addEventListener('click', () => {
+  state.measureMode = false;
+  state.measurement = null;
   state.editMode = 'ellipse';
   state.perspective = null;
   state.mode = 'draw';
@@ -1070,6 +1229,7 @@ $('drawBtn').addEventListener('click', () => {
   $('drawBtn').classList.add('primary');
 });
 $('perspectiveBtn').addEventListener('click', togglePerspectiveMode);
+$('measureBtn').addEventListener('click', () => setMeasureMode(!state.measureMode));
 $('predictionBtn').addEventListener('click', usePrediction);
 $('scoreBtn').addEventListener('click', scoreCapture);
 $('clearBtn').addEventListener('click', clearEllipse);
@@ -1239,6 +1399,15 @@ def recompute_detection_info(capture_dir):
     if frame is None:
         return None
 
+    capture_frames = []
+    for record in frames:
+        saved_path = (capture_dir / record.get("path", "")).resolve()
+        saved_frame = cv2.imread(str(saved_path)) if saved_path.is_file() else None
+        if saved_frame is None:
+            return None
+        capture_frames.append(saved_frame)
+    accumulation_frames = select_loop_accumulation_frames(capture_frames, frame_index)
+
     segment_xy = data.get("segment_xy")
     tail_tip = data.get("tail_tip")
     if not segment_xy or tail_tip is None:
@@ -1250,6 +1419,7 @@ def recompute_detection_info(capture_dir):
         tail_tip=tail_tip,
         tail_base=data.get("tail_base"),
         bbox=data.get("bbox"),
+        accumulation_frames=accumulation_frames,
     )
     if ellipse_info is None:
         return {
@@ -1474,6 +1644,47 @@ def save_label_files(capture_dir, label):
     return label_path, per_frame_path
 
 
+def measure_real_distance(raw_points, frame_size):
+    if not HOMOGRAPHY_PATH.is_file():
+        raise ValueError(f"Homography file not found: {HOMOGRAPHY_PATH}")
+    try:
+        points = np.asarray(
+            [[point["x"], point["y"]] for point in raw_points],
+            dtype=np.float64,
+        )
+        actual_size = tuple(int(value) for value in frame_size)
+    except (KeyError, TypeError, ValueError):
+        raise ValueError("Two valid image points and the frame size are required.") from None
+    if points.shape != (2, 2) or not np.isfinite(points).all():
+        raise ValueError("Exactly two finite image points are required.")
+    if len(actual_size) != 2 or min(actual_size) <= 0:
+        raise ValueError("A valid frame size is required.")
+
+    try:
+        with np.load(HOMOGRAPHY_PATH) as mapping:
+            expected_size = tuple(int(value) for value in mapping["frame_size"])
+            if actual_size != expected_size:
+                raise ValueError(
+                    f"Frame size {actual_size} does not match homography size "
+                    f"{expected_size}. Create a homography for this frame resolution."
+                )
+            undistorted = cv2.undistortPoints(
+                points.reshape(-1, 1, 2),
+                np.asarray(mapping["scaled_camera_matrix"], dtype=np.float64),
+                np.asarray(mapping["dist_coeffs"], dtype=np.float64),
+                P=np.asarray(mapping["new_camera_matrix"], dtype=np.float64),
+            )
+            world_points = cv2.perspectiveTransform(
+                undistorted,
+                np.asarray(mapping["image_to_world"], dtype=np.float64),
+            ).reshape(-1, 2)
+    except (OSError, KeyError) as error:
+        raise ValueError(f"Could not load homography data: {error}") from error
+
+    distance_mm = float(np.linalg.norm(world_points[1] - world_points[0]))
+    return distance_mm, world_points
+
+
 # Flask routes
 
 @app.get("/")
@@ -1544,9 +1755,22 @@ def api_score_capture(capture_id):
     return jsonify(result)
 
 
+@app.post("/api/measure-distance")
+def api_measure_distance():
+    payload = request.get_json(silent=True) or {}
+    try:
+        distance_mm, world_points = measure_real_distance(
+            payload.get("points"), payload.get("frame_size")
+        )
+    except ValueError as error:
+        return jsonify({"error": str(error)}), 400
+    return jsonify({"distance_mm": distance_mm, "world_points": world_points.tolist()})
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description="Browser-based capture ellipse labeler.")
     parser.add_argument("--root", default="output", help="Folder containing capture output folders.")
+    parser.add_argument("--homography", type=Path, default=HOMOGRAPHY_PATH, help="Saved planar homography NPZ file.")
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=8050)
     return parser.parse_args()
@@ -1555,4 +1779,5 @@ def parse_args():
 if __name__ == "__main__":
     args = parse_args()
     CAPTURE_ROOT = Path(args.root).resolve()
+    HOMOGRAPHY_PATH = args.homography.resolve()
     app.run(host=args.host, port=args.port, threaded=True, use_reloader=False)

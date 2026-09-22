@@ -135,11 +135,11 @@ def score_ellipses(truth_ellipse, prediction_ellipse, image_width, image_height)
     boundary_iou = mask_iou(truth_boundary, pred_boundary)
 
     base_weights = {
-        "boundary_iou": 0.45,
-        "filled_iou": 0.25,
-        "center_score": 0.15,
-        "axis_score": 0.10,
-        "angle_score": components["angle_weight"],
+        "boundary_iou": 0.0,
+        "filled_iou": 1.0,
+        "center_score": 0.0,
+        "axis_score": 0.0,
+        "angle_score": 0.0,
     }
     active_weight_sum = sum(base_weights.values())
     weighted = (
@@ -179,10 +179,10 @@ def score_ellipse_shape(truth_ellipse, prediction_ellipse):
     boundary_iou = mask_iou(truth_boundary, pred_boundary)
 
     base_weights = {
-        "boundary_iou": 0.50,
-        "filled_iou": 0.25,
-        "axis_score": 0.20,
-        "angle_score": components["angle_weight"],
+        "boundary_iou": 0.0,
+        "filled_iou": 1.0,
+        "axis_score": 0.0,
+        "angle_score": 0.0,
     }
     active_weight_sum = sum(base_weights.values())
     weighted = (
