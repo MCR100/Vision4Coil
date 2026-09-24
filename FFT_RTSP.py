@@ -660,23 +660,12 @@ def process_rtsp_stream(
                 segment_time = []
                 segment_intensities = []
                 print(f"Segment START at {segment_start:.2f}s")
-                run_log.info(
-                    "segment_started input_time_s=%.2f intensity=%.3f",
-                    segment_start,
-                    intensity,
-                )
 
             elif in_segment and intensity < THRESHOLD:
                 segment_end = round(current_time, 2)
                 in_segment = False
                 segment_duration = segment_end - segment_start
                 print(f"Segment END at {segment_end:.2f}s")
-                run_log.info(
-                    "segment_finished input_time_s=%.2f duration_s=%.2f intensity=%.3f",
-                    segment_end,
-                    segment_duration,
-                    intensity,
-                )
 
                 if segment_duration >= MIN_SEGMENT_DURATION_SECONDS:
                     start_dt = datetime.now() - timedelta(seconds=segment_duration)
@@ -713,11 +702,6 @@ def process_rtsp_stream(
                             )
                 else:
                     print(f"Segment duration {segment_duration:.2f}s too short. Skipped.")
-                    run_log.info(
-                        "segment_skipped reason=too_short duration_s=%.2f minimum_duration_s=%.2f",
-                        segment_duration,
-                        MIN_SEGMENT_DURATION_SECONDS,
-                    )
                     if active_capture is not None:
                         active_capture.discard()
 

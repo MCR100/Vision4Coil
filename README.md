@@ -180,7 +180,6 @@ logs/pipeline_20260924T141530_123456Z_a1b2c3d4.log
 Each line has a UTC timestamp and severity. The log records:
 
 - Pipeline and input start/end events, run mode, and total duration
-- Segment detection and skipped short segments
 - Capture processing start/end, status, frame count, and processing duration
 - Missing tail masks, missing ellipse fits, recoverable warnings, and exceptions
 
