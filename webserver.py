@@ -14,6 +14,7 @@ class WebSink(FFT_RTSP.BaseSink):
         self.latest_roi_jpg = None
         self.latest_frame_jpg = None
         self.latest_t = 0.0
+        self.latest_log_file = None
         self.latest_intensity = 0.0
         self.series_t = deque(maxlen=max_points)
         self.series_y = deque(maxlen=max_points)
@@ -23,6 +24,10 @@ class WebSink(FFT_RTSP.BaseSink):
     def _encode(self, img, quality=80):
         ok, jpg = cv2.imencode(".jpg", img, [int(cv2.IMWRITE_JPEG_QUALITY), int(quality)])
         return jpg.tobytes() if ok else None
+
+    def on_pipeline_started(self, log_path: str):
+        with self.lock:
+            self.latest_log_file = log_path
 
     def on_roi(self, roi_view, t_s: float, intensity: float):
         with self.lock:
@@ -52,6 +57,7 @@ class WebSink(FFT_RTSP.BaseSink):
         with self.lock:
             return {
                 "running": self.running,
+                "log_file": self.latest_log_file,
                 "time": self.latest_t,
                 "intensity": self.latest_intensity,
                 "series_t": list(self.series_t),
@@ -74,7 +80,7 @@ roi_points = [(677, 1288), (1325, 1418), (1425, 1171), (893, 1051)]
 def run_worker(source: str):
     sink.running = True
     try:
-        FFT_RTSP.process_rtsp_stream(source, roi_points, sink=sink)
+        FFT_RTSP.process_rtsp_stream(source, roi_points, sink=sink, run_mode="web")
     finally:
         sink.running = False
 

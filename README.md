@@ -168,18 +168,33 @@ The web server runs the same processing pipeline internally but streams results 
 
 ### Saving Logs
 
-To run and save the log:
+Every input run now creates its own log automatically under `logs/`, whether
+processing is started from `FFT_RTSP.py`, from another headless caller, or
+from the web interface. The generated filename contains the UTC start time and
+a short unique ID:
 
-```
-python FFT_RTSP.py > output_log.txt 2>&1         # if using Linux or Windows CMD
-python FFT_RTSP.py *>&1 | Tee-Object -FilePath output_log.txt   # if using Windows PowerShell
+```text
+logs/pipeline_20260924T141530_123456Z_a1b2c3d4.log
 ```
 
-If using the web server:
+Each line has a UTC timestamp and severity. The log records:
 
+- Pipeline and input start/end events, run mode, and total duration
+- Segment detection and skipped short segments
+- Capture processing start/end, status, frame count, and processing duration
+- Missing tail masks, missing ellipse fits, recoverable warnings, and exceptions
+
+For example:
+
+```text
+2026-09-24T14:15:30.123Z | INFO | pipeline_started mode=web source=video.mov log_file=logs/...
+2026-09-24T14:16:02.456Z | INFO | capture_processing_finished capture_id=... status=completed duration_s=6.731
+2026-09-24T14:16:04.789Z | INFO | pipeline_finished status=completed duration_s=34.666 frames_processed=900 captures_processed=1
 ```
-python webserver.py > output_log.txt 2>&1
-```
+
+Credentials in RTSP URLs are replaced with `***:***` in log messages.
+In web mode, the current log path is also returned as `log_file` by
+`/api/state`.
 
 ---
 

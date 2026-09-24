@@ -3,13 +3,16 @@ import numpy as np
 import os
 import json
 import shutil
-from datetime import datetime
+import time
+from datetime import datetime, timedelta
 from functools import lru_cache
 
 import plotly.graph_objects as go
 import matplotlib.pyplot as plt
 from pathlib import Path
 from collections import deque
+
+from pipeline_logging import PipelineRunLog
 
 from coil_cv import (
     BODY_POLYLINE_POINTS,
@@ -46,6 +49,7 @@ RTSP_URL = f"rtsp://{USERNAME}:{PASSWORD}@{CAMERA_IP}:554/cam/realmonitor?channe
 
 OUTPUT_DIR = Path("output")
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+PIPELINE_LOG_DIR = Path("logs")
 
 DEBUG_SAVE_INTERMEDIATE = True
 MIN_SEGMENT_DURATION_SECONDS = 10.0
@@ -56,6 +60,9 @@ CAPTURE_JPEG_QUALITY = 90
 # Sink interface
 # --------------
 class BaseSink:
+    def on_pipeline_started(self, log_path: str):
+        pass
+
     def on_roi(self, roi_view, t_s: float, intensity: float):
         pass
 
@@ -292,10 +299,18 @@ class ActiveCaptureWriter:
 # -------------------------
 # Detection + save
 # -------------------------
-def detect_tail_and_save(frames, roi_points, save_path, conf_thresh=0.6):
+def detect_tail_and_save(frames, roi_points, save_path, conf_thresh=0.6, run_log=None):
+    capture_id = Path(save_path).name
     best = extract_best_tail_segment(frames, conf_thresh=conf_thresh)
     if best is None:
-        return
+        if run_log is not None:
+            run_log.warning(
+                "tail_mask_not_found capture_id=%s frame_count=%d confidence_threshold=%.3f",
+                capture_id,
+                len(frames),
+                conf_thresh,
+            )
+        return {"status": "no_tail_mask", "capture_id": capture_id}
 
     best_frame_index = best.get("frame_index", max(0, len(frames) - 1))
     best_frame = best["frame"]
@@ -317,6 +332,11 @@ def detect_tail_and_save(frames, roi_points, save_path, conf_thresh=0.6):
     seg_cent = segment_centroid(segment_xy)
 
     if tail_tip is None:
+        if run_log is not None:
+            run_log.warning(
+                "tail_tip_not_found_using_bbox_center capture_id=%s",
+                capture_id,
+            )
         x1, y1, x2, y2 = best_box
         tail_tip = ((x1 + x2) / 2.0, (y1 + y2) / 2.0)
 
@@ -338,6 +358,13 @@ def detect_tail_and_save(frames, roi_points, save_path, conf_thresh=0.6):
         accumulation_frames=accumulation_frames,
     )
     loop_roi_box = None if loop_diagnostics is None else loop_diagnostics.get("roi_box")
+    if ellipse_info is None and run_log is not None:
+        selection_reason = None if loop_diagnostics is None else loop_diagnostics.get("selection_reason")
+        run_log.warning(
+            "ellipse_fit_not_found capture_id=%s selection_reason=%s",
+            capture_id,
+            selection_reason,
+        )
 
     tail_loop_angle_deg = None
     annotated = best_frame.copy()
@@ -385,6 +412,12 @@ def detect_tail_and_save(frames, roi_points, save_path, conf_thresh=0.6):
                 ellipse_info, segment_xy, best_frame.shape, BODY_POLYLINE_POINTS
             )
         except Exception:
+            if run_log is not None:
+                run_log.warning(
+                    "ellipse_distance_failed capture_id=%s",
+                    capture_id,
+                    exc_info=True,
+                )
             dist_info = None
 
         if dist_info is not None:
@@ -404,7 +437,12 @@ def detect_tail_and_save(frames, roi_points, save_path, conf_thresh=0.6):
             dist_info = None
 
     img_path = os.path.join(save_path, f"tail_detected_{best_conf:.2f}.jpg")
-    cv2.imwrite(img_path, annotated)
+    if not cv2.imwrite(img_path, annotated) and run_log is not None:
+        run_log.error(
+            "capture_image_write_failed capture_id=%s path=%s",
+            capture_id,
+            img_path,
+        )
     print(f"Saved tail image: {img_path}")
 
     seg_mask = polygon_to_mask(segment_xy, best_frame.shape)
@@ -527,49 +565,87 @@ def detect_tail_and_save(frames, roi_points, save_path, conf_thresh=0.6):
             final_label_info=label_info,
         )
 
+    return {
+        "status": "completed" if ellipse_info is not None else "no_ellipse_fit",
+        "capture_id": capture_id,
+        "ellipse_method": None if ellipse_info is None else ellipse_info.get("method"),
+    }
+
 
 # -------------------------
 # Main processing loop
 # -------------------------
-def process_rtsp_stream(rtsp_url, roi_points, sink: BaseSink | None = None, fps_assumed=30):
+def infer_run_mode(sink):
+    if isinstance(sink, CvGuiSink):
+        return "local_gui"
+    if isinstance(sink, NullSink):
+        return "headless"
+    return sink.__class__.__name__.removesuffix("Sink").lower() or "headless"
+
+
+def process_rtsp_stream(
+    rtsp_url,
+    roi_points,
+    sink: BaseSink | None = None,
+    fps_assumed=30,
+    run_mode=None,
+    log_dir=PIPELINE_LOG_DIR,
+):
     if sink is None:
         sink = NullSink()
 
-    print("Real-time stream started.")
-
-    cap = cv2.VideoCapture(rtsp_url, cv2.CAP_FFMPEG)
-    if not cap.isOpened():
-        print("Error: Cannot open RTSP/video stream.")
-        return
-
-    fps = cap.get(cv2.CAP_PROP_FPS)
-    if not fps or fps <= 0:
-        fps = float(fps_assumed)
-
+    run_mode = run_mode or infer_run_mode(sink)
+    run_log = PipelineRunLog(rtsp_url, run_mode, log_dir=log_dir)
+    cap = None
+    status = "starting"
     frame_idx = 0
+    frames_processed = 0
+    captures_processed = 0
     in_segment = False
     segment_start = None
-
     active_capture = None
     segment_time = []
     segment_intensities = []
-
     graph_time = deque(maxlen=3000)
     graph_intensity = deque(maxlen=3000)
 
+    print(f"Data input processing started. Log: {run_log.path}")
+
     try:
+        sink.on_pipeline_started(str(run_log.path))
+        run_log.info("input_opening")
+        cap = cv2.VideoCapture(rtsp_url, cv2.CAP_FFMPEG)
+        if not cap.isOpened():
+            status = "input_open_failed"
+            run_log.error("input_open_failed source=%s", run_log.source)
+            print("Error: Cannot open RTSP/video stream.")
+            return {"status": status, "log_file": str(run_log.path)}
+
+        fps = cap.get(cv2.CAP_PROP_FPS)
+        if not fps or fps <= 0:
+            fps = float(fps_assumed)
+            run_log.warning("input_fps_unavailable using_assumed_fps=%.3f", fps)
+
+        status = "running"
+        run_log.info("input_opened fps=%.3f threshold=%.3f", fps, THRESHOLD)
+
         while cap.isOpened():
             ret, frame = cap.read()
             if not ret:
                 print("Stream ended or not receiving frames.")
+                run_log.info("input_exhausted frame_count=%d", frames_processed)
+                status = "completed"
                 break
 
             current_time = frame_idx / fps
+            frames_processed += 1
             intensity, roi_view = compute_fft_spectrum(frame, roi_points)
 
             sink.on_roi(roi_view, current_time, float(intensity))
             sink.on_frame(frame, current_time, float(intensity))
             if sink.should_stop():
+                status = "stopped"
+                run_log.info("stop_requested frame_index=%d input_time_s=%.3f", frame_idx, current_time)
                 break
 
             graph_time.append(current_time)
@@ -584,12 +660,23 @@ def process_rtsp_stream(rtsp_url, roi_points, sink: BaseSink | None = None, fps_
                 segment_time = []
                 segment_intensities = []
                 print(f"Segment START at {segment_start:.2f}s")
+                run_log.info(
+                    "segment_started input_time_s=%.2f intensity=%.3f",
+                    segment_start,
+                    intensity,
+                )
 
             elif in_segment and intensity < THRESHOLD:
                 segment_end = round(current_time, 2)
                 in_segment = False
                 segment_duration = segment_end - segment_start
                 print(f"Segment END at {segment_end:.2f}s")
+                run_log.info(
+                    "segment_finished input_time_s=%.2f duration_s=%.2f intensity=%.3f",
+                    segment_end,
+                    segment_duration,
+                    intensity,
+                )
 
                 if segment_duration >= MIN_SEGMENT_DURATION_SECONDS:
                     start_dt = datetime.now() - timedelta(seconds=segment_duration)
@@ -599,10 +686,38 @@ def process_rtsp_stream(rtsp_url, roi_points, sink: BaseSink | None = None, fps_
                     save_results_txt(segment_time, segment_intensities, base)
                     save_results_html(segment_time, segment_intensities, base)
                     if active_capture is not None:
-                        active_capture.finalize(folder, segment_end)
-                        detect_tail_and_save(active_capture.detection_frame_list(), roi_points, folder)
+                        capture_id = Path(folder).name
+                        capture_started = time.perf_counter()
+                        capture_status = "failed"
+                        run_log.info(
+                            "capture_processing_started capture_id=%s frame_count=%d",
+                            capture_id,
+                            len(active_capture.detection_frames),
+                        )
+                        try:
+                            active_capture.finalize(folder, segment_end)
+                            result = detect_tail_and_save(
+                                active_capture.detection_frame_list(),
+                                roi_points,
+                                folder,
+                                run_log=run_log,
+                            )
+                            capture_status = (result or {}).get("status", "completed")
+                        finally:
+                            captures_processed += 1
+                            run_log.info(
+                                "capture_processing_finished capture_id=%s status=%s duration_s=%.3f",
+                                capture_id,
+                                capture_status,
+                                time.perf_counter() - capture_started,
+                            )
                 else:
                     print(f"Segment duration {segment_duration:.2f}s too short. Skipped.")
+                    run_log.info(
+                        "segment_skipped reason=too_short duration_s=%.2f minimum_duration_s=%.2f",
+                        segment_duration,
+                        MIN_SEGMENT_DURATION_SECONDS,
+                    )
                     if active_capture is not None:
                         active_capture.discard()
 
@@ -620,13 +735,34 @@ def process_rtsp_stream(rtsp_url, roi_points, sink: BaseSink | None = None, fps_
 
             frame_idx += 1
 
+        if status == "running":
+            status = "completed"
+    except Exception:
+        status = "failed"
+        run_log.exception("pipeline_error frame_index=%d", frame_idx)
+        raise
     finally:
         if active_capture is not None:
             active_capture.discard()
-        cap.release()
-        sink.close()
-        print("RTSP stream processing complete.")
+            run_log.info(
+                "active_capture_discarded reason=pipeline_finished segment_start_s=%s",
+                segment_start,
+            )
+        if cap is not None:
+            cap.release()
+        try:
+            sink.close()
+        except Exception:
+            status = "failed"
+            run_log.exception("sink_close_failed")
+        run_log.finish(
+            status,
+            frames_processed=frames_processed,
+            captures_processed=captures_processed,
+        )
+        print(f"Data input processing complete. Log: {run_log.path}")
 
+    return {"status": status, "log_file": str(run_log.path)}
 
 if __name__ == "__main__":
     roi_points = [(677, 1288), (1325, 1418), (1425, 1171), (893, 1051)]
